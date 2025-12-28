@@ -340,8 +340,6 @@ private:
 
         if (pop.find_pop(c, &offset)) {
             node* child = children[offset];
-            // Hold the lock while getting the child pointer, then release
-            // The child cannot be deleted while we hold this lock
             lock.unlock();
             return child->insert_internal(key, value, this, c);
         } else {
@@ -361,6 +359,136 @@ private:
             child->data = value;
             return {child, true};
         }
+    }
+
+    // Compact insert - full path compression, stores entire key in skip when possible
+    std::pair<node*, bool> insert_internal_compact(key_tp& key, const T& value) {
+        std::unique_lock lock(mtx);
+
+        const std::string key_str = key.remaining();
+        
+        // Empty node - just store everything here
+        if (skip.empty() && !has_data && pop.empty()) {
+            skip = key_str;
+            has_data = true;
+            data = value;
+            return {this, true};
+        }
+
+        // Find longest common prefix
+        size_t i = 0;
+        while (i < skip.size() && i < key_str.size() && skip[i] == key_str[i]) {
+            ++i;
+        }
+
+        // Case 1: Exact match
+        if (i == skip.size() && i == key_str.size()) {
+            bool was_new = !has_data;
+            has_data = true;
+            data = value;
+            return {this, was_new};
+        }
+
+        // Case 2: Key is prefix of skip - split, this node gets the data
+        if (i == key_str.size()) {
+            // key_str = "a", skip = "abc"
+            // Result: this node gets skip="a" data=value, child gets skip="c" (edge='b')
+            auto* child = new node();
+            child->skip = skip.substr(i + 1);  // "c"
+            child->has_data = has_data;
+            child->data = std::move(data);
+            child->children = std::move(children);
+            child->pop = pop;
+            child->parent = this;
+            child->parent_edge = skip[i];  // 'b'
+
+            for (auto* gc : child->children) {
+                if (gc) {
+                    std::unique_lock gc_lock(gc->mtx);
+                    gc->parent = child;
+                }
+            }
+
+            skip = key_str;  // "a"
+            has_data = true;
+            data = value;
+            children.clear();
+            pop = pop_tp{};
+            int idx = pop.set_bit(child->parent_edge);
+            children.insert(children.begin() + idx, child);
+
+            return {this, true};
+        }
+
+        // Case 3: Skip is prefix of key - recurse to child
+        if (i == skip.size()) {
+            // skip = "a", key_str = "abc"
+            // Look for child with edge key_str[i] = 'b'
+            char edge = key_str[i];
+            int offset;
+            
+            if (pop.find_pop(edge, &offset)) {
+                node* child = children[offset];
+                key.eat(i + 1);  // consume matched prefix + edge char
+                lock.unlock();
+                return child->insert_internal_compact(key, value);
+            } else {
+                // No child - create one with remaining key
+                auto* child = new node();
+                child->skip = key_str.substr(i + 1);  // "c"
+                child->has_data = true;
+                child->data = value;
+                child->parent = this;
+                child->parent_edge = edge;  // 'b'
+
+                int idx = pop.set_bit(edge);
+                children.insert(children.begin() + idx, child);
+
+                return {child, true};
+            }
+        }
+
+        // Case 4: Divergence in the middle
+        // skip = "abc", key = "axyz" -> common prefix = "a"
+        // Need to split: this gets "a", one child gets "bc", another gets "xyz"
+        
+        auto* old_child = new node();
+        old_child->skip = skip.substr(i + 1);  // "c"
+        old_child->has_data = has_data;
+        old_child->data = std::move(data);
+        old_child->children = std::move(children);
+        old_child->pop = pop;
+        old_child->parent = this;
+        old_child->parent_edge = skip[i];  // 'b'
+
+        for (auto* gc : old_child->children) {
+            if (gc) {
+                std::unique_lock gc_lock(gc->mtx);
+                gc->parent = old_child;
+            }
+        }
+
+        auto* new_child = new node();
+        new_child->skip = key_str.substr(i + 1);  // "yz"
+        new_child->has_data = true;
+        new_child->data = value;
+        new_child->parent = this;
+        new_child->parent_edge = key_str[i];  // 'x'
+
+        // Reset this node to common prefix
+        skip = key_str.substr(0, i);  // "a"
+        has_data = false;
+        data = T{};
+        children.clear();
+        pop = pop_tp{};
+
+        int idx1 = pop.set_bit(old_child->parent_edge);
+        children.insert(children.begin() + idx1, old_child);
+        
+        int idx2 = pop.set_bit(new_child->parent_edge);
+        children.insert(children.begin() + idx2, new_child);
+
+        return {new_child, true};
     }
 
     // Remove - returns {should_remove_this_node, was_removed, should_compact}
@@ -778,10 +906,10 @@ public:
     // Insert a key-value pair, returns true if new entry
     bool insert(const std::string& key, const T& value) {
         std::unique_lock wlock(write_mtx);  // Serialize writes
-        std::unique_lock lock(mtx);  // Exclusive access
+        std::unique_lock lock(mtx);
         
         key_tp cp(key);
-        auto [result_node, was_new] = head.insert_internal(cp, value);
+        auto [result_node, was_new] = head.insert_internal_compact(cp, value);
 
         if (was_new) {
             ++count;
