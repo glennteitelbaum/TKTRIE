@@ -1,246 +1,382 @@
-#include <chrono>
-#include <iostream>
-#include <vector>
-#include <string>
-#include <thread>
+#pragma once
+// RCU-style trie with full compaction
+// Key insight: child pointers are already read atomically via __atomic_load_n
+// So we can UPDATE them atomically too - no need to copy parent!
+
+#include <array>
 #include <atomic>
-#include <random>
-#include <map>
-#include <unordered_map>
-#include <shared_mutex>
-#include <bit>
-#include <cstring>
-#include "tktrie.h"
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
 
-// Convert uint64_t to 8-byte big-endian string (no allocation, reuses buffer)
-inline void uint64_to_key(uint64_t v, char* buf) {
-    uint64_t be = __builtin_bswap64(v);
-    std::memcpy(buf, &be, 8);
-}
+namespace gteitelbaum {
 
-// Generate random uint64 keys as 8-byte strings
-std::vector<std::string> generate_int_keys(size_t count) {
-    std::vector<std::string> keys;
-    keys.reserve(count);
-    std::mt19937_64 rng(42);
-    std::uniform_int_distribution<uint64_t> dist(0, UINT64_MAX);
-    
-    char buf[8];
-    for (size_t i = 0; i < count; i++) {
-        uint64_to_key(dist(rng), buf);
-        keys.emplace_back(buf, 8);
-    }
-    return keys;
-}
-
-const std::vector<std::string> INT_KEYS = generate_int_keys(10000);
-
-template<typename M>
-class guarded_map {
-    M data;
-    mutable std::shared_mutex mtx;
+class RetireList {
+    struct Retired { void* ptr; void (*deleter)(void*); };
+    std::vector<Retired> list;
+    std::mutex mtx;
 public:
-    bool contains(const typename M::key_type& key) const {
-        std::shared_lock lock(mtx);
-        return data.find(key) != data.end();
+    template<typename T> void retire(T* ptr) {
+        std::lock_guard<std::mutex> lock(mtx);
+        list.push_back({ptr, [](void* p) { delete static_cast<T*>(p); }});
     }
-    bool insert(const std::pair<typename M::key_type, typename M::mapped_type>& kv) {
-        std::unique_lock lock(mtx);
-        return data.insert(kv).second;
+    ~RetireList() { for (auto& r : list) r.deleter(r.ptr); }
+};
+
+class PopCount {
+    uint64_t bits[4]{};
+public:
+    bool find(char c, int* idx) const {
+        uint8_t v = static_cast<uint8_t>(c);
+        int word = v >> 6, bit = v & 63;
+        uint64_t mask = 1ULL << bit;
+        if (!(bits[word] & mask)) return false;
+        *idx = std::popcount(bits[word] & (mask - 1));
+        for (int w = 0; w < word; ++w) *idx += std::popcount(bits[w]);
+        return true;
     }
-    bool erase(const typename M::key_type& key) {
-        std::unique_lock lock(mtx);
-        return data.erase(key) > 0;
+    int set(char c) {
+        uint8_t v = static_cast<uint8_t>(c);
+        int word = v >> 6, bit = v & 63;
+        uint64_t mask = 1ULL << bit;
+        int idx = std::popcount(bits[word] & (mask - 1));
+        for (int w = 0; w < word; ++w) idx += std::popcount(bits[w]);
+        bits[word] |= mask;
+        return idx;
+    }
+    void clear(char c) {
+        uint8_t v = static_cast<uint8_t>(c);
+        bits[v >> 6] &= ~(1ULL << (v & 63));
+    }
+    int count() const {
+        int n = 0;
+        for (auto b : bits) n += std::popcount(b);
+        return n;
+    }
+    char first_char() const {
+        for (int w = 0; w < 4; w++) {
+            if (bits[w]) return static_cast<char>((w << 6) | std::countr_zero(bits[w]));
+        }
+        return 0;
     }
 };
 
-template<typename K, typename V>
-using locked_map = guarded_map<std::map<K, V>>;
-template<typename K, typename V>
-using locked_umap = guarded_map<std::unordered_map<K, V>>;
+template <typename T>
+struct Node {
+    PopCount pop{};
+    std::vector<Node*> children{};
+    std::string skip{};
+    T data{};
+    bool has_data{false};
 
-std::atomic<bool> stop{false};
-
-template<typename Container, typename Keys>
-double bench_find(Container& c, const Keys& keys, int threads, int ms) {
-    std::atomic<long long> ops{0};
-    stop = false;
-    std::vector<std::thread> workers;
+    Node() = default;
+    Node(const Node& o) : pop(o.pop), children(o.children), skip(o.skip), data(o.data), has_data(o.has_data) {}
     
-    for (int t = 0; t < threads; t++) {
-        workers.emplace_back([&]() {
-            long long local = 0;
-            while (!stop) {
-                for (const auto& k : keys) { c.contains(k); local++; }
-            }
-            ops += local;
-        });
+    Node* get_child(char c) const {
+        int idx;
+        if (pop.find(c, &idx)) return __atomic_load_n(&children[idx], __ATOMIC_ACQUIRE);
+        return nullptr;
     }
+    int child_count() const { return pop.count(); }
     
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    stop = true;
-    for (auto& w : workers) w.join();
-    return ops * 1000.0 / ms;
-}
-
-template<typename Container, typename Keys, typename V>
-double bench_insert(Container& c, const Keys& keys, int threads, int ms) {
-    std::atomic<long long> ops{0};
-    stop = false;
-    std::vector<std::thread> workers;
-    
-    for (int t = 0; t < threads; t++) {
-        workers.emplace_back([&, t]() {
-            long long local = 0;
-            int i = 0;
-            while (!stop) {
-                for (const auto& k : keys) { c.insert({k, (V)(t*10000 + i++)}); local++; }
-            }
-            ops += local;
-        });
+    // Atomically set child pointer (for in-place updates under write lock)
+    void set_child(int idx, Node* child) {
+        __atomic_store_n(&children[idx], child, __ATOMIC_RELEASE);
     }
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    stop = true;
-    for (auto& w : workers) w.join();
-    return ops * 1000.0 / ms;
-}
+};
 
-template<typename Container, typename Keys>
-double bench_erase(Container& c, const Keys& keys, int threads, int ms) {
-    std::atomic<long long> ops{0};
-    stop = false;
-    std::vector<std::thread> workers;
-    
-    for (int t = 0; t < threads; t++) {
-        workers.emplace_back([&]() {
-            long long local = 0;
-            while (!stop) {
-                for (const auto& k : keys) { c.erase(k); local++; }
-            }
-            ops += local;
-        });
-    }
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    stop = true;
-    for (auto& w : workers) w.join();
-    return ops * 1000.0 / ms;
-}
+template <typename Key, typename T>
+class tktrie {
+public:
+    using node_type = Node<T>;
+    using size_type = std::size_t;
 
-template<typename Container, typename Keys, typename V>
-double bench_mixed_find(const Keys& keys, int find_threads, int write_threads, int ms) {
-    Container c;
-    for (size_t i = 0; i < keys.size(); i++) c.insert({keys[i], (V)i});
-    
-    std::atomic<long long> find_ops{0};
-    stop = false;
-    std::vector<std::thread> workers;
-    
-    for (int t = 0; t < find_threads; t++) {
-        workers.emplace_back([&]() {
-            long long local = 0;
-            while (!stop) {
-                for (const auto& k : keys) { c.contains(k); local++; }
+private:
+    std::atomic<node_type*> root_{new node_type()};
+    std::atomic<size_type> elem_count_{0};
+    RetireList retired_;
+    std::mutex write_mutex_;
+
+public:
+    tktrie() = default;
+    ~tktrie() { delete_tree(root_.load(std::memory_order_relaxed)); }
+
+    bool empty() const { return size() == 0; }
+    size_type size() const { return elem_count_.load(std::memory_order_relaxed); }
+
+    node_type* find(const Key& key) const {
+        std::string_view kv(key);
+        node_type* cur = root_.load(std::memory_order_acquire);
+        while (cur) {
+            const std::string& skip = cur->skip;
+            if (!skip.empty()) {
+                if (kv.size() < skip.size()) return nullptr;
+                if (kv.substr(0, skip.size()) != skip) return nullptr;
+                kv.remove_prefix(skip.size());
             }
-            find_ops += local;
-        });
+            if (kv.empty()) return cur->has_data ? cur : nullptr;
+            char c = kv[0];
+            kv.remove_prefix(1);
+            cur = cur->get_child(c);
+        }
+        return nullptr;
     }
-    
-    for (int t = 0; t < write_threads; t++) {
-        workers.emplace_back([&, t]() {
-            int i = 0;
-            while (!stop) {
-                for (size_t j = 0; j < keys.size(); j++) {
-                    if (j % 2 == 0) c.insert({keys[j], (V)(t*10000 + i++)});
-                    else c.erase(keys[j]);
+
+    bool contains(const Key& key) const { return find(key) != nullptr; }
+
+    bool insert(const std::pair<const Key, T>& value) {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        return insert_impl(value.first, value.second);
+    }
+
+    bool erase(const Key& key) {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        return erase_impl(key);
+    }
+
+private:
+    void delete_tree(node_type* n) {
+        if (!n) return;
+        for (auto* c : n->children) delete_tree(c);
+        delete n;
+    }
+
+    bool insert_impl(const Key& key, const T& value) {
+        size_t kpos = 0;
+        node_type** parent_child_ptr = nullptr;
+        node_type* cur = root_.load(std::memory_order_acquire);
+        bool at_root = true;
+        
+        while (true) {
+            const std::string& skip = cur->skip;
+            size_t common = 0;
+            while (common < skip.size() && kpos + common < key.size() &&
+                   skip[common] == key[kpos + common]) ++common;
+
+            if (kpos + common == key.size() && common == skip.size()) {
+                if (cur->has_data) return false;
+                node_type* n = new node_type(*cur);
+                n->has_data = true;
+                n->data = value;
+                if (at_root) root_.store(n, std::memory_order_release);
+                else __atomic_store_n(parent_child_ptr, n, __ATOMIC_RELEASE);
+                retired_.retire(cur);
+                elem_count_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+
+            if (kpos + common == key.size()) {
+                node_type* split = new node_type();
+                split->skip = skip.substr(0, common);
+                split->has_data = true;
+                split->data = value;
+                node_type* child = new node_type(*cur);
+                child->skip = skip.substr(common + 1);
+                split->pop.set(skip[common]);
+                split->children.push_back(child);
+                if (at_root) root_.store(split, std::memory_order_release);
+                else __atomic_store_n(parent_child_ptr, split, __ATOMIC_RELEASE);
+                retired_.retire(cur);
+                elem_count_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+
+            if (common == skip.size()) {
+                kpos += common;
+                char c = key[kpos];
+                int idx;
+                if (!cur->pop.find(c, &idx)) {
+                    node_type* n = new node_type(*cur);
+                    node_type* leaf = new node_type();
+                    leaf->skip = key.substr(kpos + 1);
+                    leaf->has_data = true;
+                    leaf->data = value;
+                    int new_idx = n->pop.set(c);
+                    n->children.insert(n->children.begin() + new_idx, leaf);
+                    if (at_root) root_.store(n, std::memory_order_release);
+                    else __atomic_store_n(parent_child_ptr, n, __ATOMIC_RELEASE);
+                    retired_.retire(cur);
+                    elem_count_.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+                parent_child_ptr = &cur->children[idx];
+                cur = cur->children[idx];
+                at_root = false;
+                kpos++;
+                continue;
+            }
+
+            node_type* split = new node_type();
+            split->skip = skip.substr(0, common);
+            node_type* old_child = new node_type(*cur);
+            old_child->skip = (common + 1 < skip.size()) ? skip.substr(common + 1) : "";
+            node_type* new_child = new node_type();
+            new_child->skip = (kpos + common + 1 < key.size()) ? key.substr(kpos + common + 1) : "";
+            new_child->has_data = true;
+            new_child->data = value;
+            char old_edge = skip[common], new_edge = key[kpos + common];
+            if (old_edge < new_edge) {
+                split->pop.set(old_edge); split->pop.set(new_edge);
+                split->children.push_back(old_child); split->children.push_back(new_child);
+            } else {
+                split->pop.set(new_edge); split->pop.set(old_edge);
+                split->children.push_back(new_child); split->children.push_back(old_child);
+            }
+            if (at_root) root_.store(split, std::memory_order_release);
+            else __atomic_store_n(parent_child_ptr, split, __ATOMIC_RELEASE);
+            retired_.retire(cur);
+            elem_count_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+
+    // Erase result: what to do at this level
+    enum class EraseAction { 
+        NotFound,      // Key not found
+        KeepNode,      // Node stays, just update child pointer
+        ReplaceNode,   // Replace with new node
+        RemoveNode     // Remove this node entirely
+    };
+
+    struct EraseResult {
+        EraseAction action;
+        node_type* replacement;  // For ReplaceNode
+        node_type* to_retire;    // Node being retired (if any)
+    };
+
+    EraseResult erase_at(node_type* cur, const Key& key, size_t kpos) {
+        const std::string& skip = cur->skip;
+        
+        if (!skip.empty()) {
+            if (key.size() - kpos < skip.size()) return {EraseAction::NotFound, nullptr, nullptr};
+            if (key.substr(kpos, skip.size()) != skip) return {EraseAction::NotFound, nullptr, nullptr};
+            kpos += skip.size();
+        }
+        
+        if (kpos == key.size()) {
+            if (!cur->has_data) return {EraseAction::NotFound, nullptr, nullptr};
+            
+            int nchildren = cur->child_count();
+            
+            if (nchildren == 0) {
+                return {EraseAction::RemoveNode, nullptr, cur};
+            } else if (nchildren == 1) {
+                char edge = cur->pop.first_char();
+                node_type* child = cur->get_child(edge);
+                node_type* merged = new node_type();
+                merged->skip = cur->skip + std::string(1, edge) + child->skip;
+                merged->has_data = child->has_data;
+                merged->data = child->data;
+                merged->pop = child->pop;
+                merged->children = child->children;
+                // Note: child is now "absorbed", retire it too
+                retired_.retire(child);
+                return {EraseAction::ReplaceNode, merged, cur};
+            } else {
+                node_type* n = new node_type(*cur);
+                n->has_data = false;
+                n->data = T{};
+                return {EraseAction::ReplaceNode, n, cur};
+            }
+        }
+        
+        // Continue to child
+        char c = key[kpos];
+        int idx;
+        if (!cur->pop.find(c, &idx)) return {EraseAction::NotFound, nullptr, nullptr};
+        
+        node_type* child = cur->children[idx];
+        EraseResult child_result = erase_at(child, key, kpos + 1);
+        
+        if (child_result.action == EraseAction::NotFound) {
+            return {EraseAction::NotFound, nullptr, nullptr};
+        }
+        
+        if (child_result.to_retire) {
+            retired_.retire(child_result.to_retire);
+        }
+        
+        if (child_result.action == EraseAction::KeepNode) {
+            // Child handled everything, we stay the same
+            return {EraseAction::KeepNode, nullptr, nullptr};
+        }
+        
+        if (child_result.action == EraseAction::ReplaceNode) {
+            // Child was replaced - update our pointer (atomic, no copy needed!)
+            cur->set_child(idx, child_result.replacement);
+            return {EraseAction::KeepNode, nullptr, nullptr};
+        }
+        
+        // child_result.action == EraseAction::RemoveNode
+        // Child was removed - we need to update our structure
+        int remaining = cur->child_count() - 1;
+        
+        if (remaining == 0 && !cur->has_data) {
+            // We become empty too - remove
+            return {EraseAction::RemoveNode, nullptr, cur};
+        } else if (remaining == 1 && !cur->has_data) {
+            // Merge with our remaining child
+            char other_edge = 0;
+            node_type* other_child = nullptr;
+            for (size_t i = 0; i < cur->children.size(); i++) {
+                if ((int)i != idx) {
+                    other_child = cur->children[i];
+                    int cnt = 0;
+                    for (int w = 0; w < 4; w++) {
+                        uint64_t bits = *(reinterpret_cast<const uint64_t*>(&cur->pop) + w);
+                        while (bits) {
+                            if (cnt == (int)i) {
+                                other_edge = static_cast<char>((w << 6) | std::countr_zero(bits));
+                                goto found;
+                            }
+                            bits &= bits - 1;
+                            cnt++;
+                        }
+                    }
+                    found:;
+                    break;
                 }
             }
-        });
+            
+            node_type* merged = new node_type();
+            merged->skip = cur->skip + std::string(1, other_edge) + other_child->skip;
+            merged->has_data = other_child->has_data;
+            merged->data = other_child->data;
+            merged->pop = other_child->pop;
+            merged->children = other_child->children;
+            retired_.retire(other_child);
+            return {EraseAction::ReplaceNode, merged, cur};
+        } else {
+            // Remove child from our list (need to copy - structure changes)
+            node_type* n = new node_type(*cur);
+            n->pop.clear(c);
+            n->children.erase(n->children.begin() + idx);
+            return {EraseAction::ReplaceNode, n, cur};
+        }
     }
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    stop = true;
-    for (auto& w : workers) w.join();
-    return find_ops * 1000.0 / ms;
-}
 
-int main() {
-    constexpr int MS = 500;
-    
-    std::cout << "=== Per-Operation Benchmark: RCU Trie vs Guarded map/umap ===\n";
-    std::cout << "Int keys (as 8-byte big-endian strings): " << INT_KEYS.size() << "\n";
-    std::cout << "Range: 0 to UINT64_MAX (full 64-bit random)\n\n";
-    
-    std::cout << "FIND (contains) - ops/sec:\n";
-    std::cout << "Threads |   RCU Trie |   std::map |  std::umap | RCU/map | RCU/umap\n";
-    std::cout << "--------|------------|------------|------------|---------|----------\n";
-    
-    for (int threads : {1, 2, 4, 8, 12, 16}) {
-        gteitelbaum::tktrie<std::string, int> rcu_t;
-        locked_map<std::string, int> lm;
-        locked_umap<std::string, int> lu;
-        for (size_t i = 0; i < INT_KEYS.size(); i++) {
-            rcu_t.insert({INT_KEYS[i], (int)i});
-            lm.insert({INT_KEYS[i], (int)i});
-            lu.insert({INT_KEYS[i], (int)i});
+    bool erase_impl(const Key& key) {
+        node_type* root = root_.load(std::memory_order_acquire);
+        EraseResult result = erase_at(root, key, 0);
+        
+        if (result.action == EraseAction::NotFound) return false;
+        
+        if (result.to_retire) {
+            retired_.retire(result.to_retire);
         }
         
-        double rcu = bench_find(rcu_t, INT_KEYS, threads, MS);
-        double map = bench_find(lm, INT_KEYS, threads, MS);
-        double umap = bench_find(lu, INT_KEYS, threads, MS);
-        printf("%7d | %10.1fM | %10.1fM | %10.1fM | %7.1fx | %8.1fx\n",
-               threads, rcu/1e6, map/1e6, umap/1e6, rcu/map, rcu/umap);
-    }
-    
-    std::cout << "\nINSERT - ops/sec:\n";
-    std::cout << "Threads |   RCU Trie |   std::map |  std::umap | RCU/map | RCU/umap\n";
-    std::cout << "--------|------------|------------|------------|---------|----------\n";
-    
-    for (int threads : {1, 2, 4, 8, 12, 16}) {
-        gteitelbaum::tktrie<std::string, int> rcu_t;
-        locked_map<std::string, int> lm;
-        locked_umap<std::string, int> lu;
-        
-        double rcu = bench_insert<decltype(rcu_t), decltype(INT_KEYS), int>(rcu_t, INT_KEYS, threads, MS);
-        double map = bench_insert<decltype(lm), decltype(INT_KEYS), int>(lm, INT_KEYS, threads, MS);
-        double umap = bench_insert<decltype(lu), decltype(INT_KEYS), int>(lu, INT_KEYS, threads, MS);
-        printf("%7d | %10.1fM | %10.1fM | %10.1fM | %7.1fx | %8.1fx\n",
-               threads, rcu/1e6, map/1e6, umap/1e6, rcu/map, rcu/umap);
-    }
-    
-    std::cout << "\nERASE - ops/sec:\n";
-    std::cout << "Threads |   RCU Trie |   std::map |  std::umap | RCU/map | RCU/umap\n";
-    std::cout << "--------|------------|------------|------------|---------|----------\n";
-    
-    for (int threads : {1, 2, 4, 8, 12, 16}) {
-        gteitelbaum::tktrie<std::string, int> rcu_t;
-        locked_map<std::string, int> lm;
-        locked_umap<std::string, int> lu;
-        for (size_t i = 0; i < INT_KEYS.size(); i++) {
-            rcu_t.insert({INT_KEYS[i], (int)i});
-            lm.insert({INT_KEYS[i], (int)i});
-            lu.insert({INT_KEYS[i], (int)i});
+        if (result.action == EraseAction::ReplaceNode) {
+            root_.store(result.replacement, std::memory_order_release);
+        } else if (result.action == EraseAction::RemoveNode) {
+            root_.store(new node_type(), std::memory_order_release);
         }
+        // KeepNode means root already updated via atomic child pointer
         
-        double rcu = bench_erase(rcu_t, INT_KEYS, threads, MS);
-        double map = bench_erase(lm, INT_KEYS, threads, MS);
-        double umap = bench_erase(lu, INT_KEYS, threads, MS);
-        printf("%7d | %10.1fM | %10.1fM | %10.1fM | %7.1fx | %8.1fx\n",
-               threads, rcu/1e6, map/1e6, umap/1e6, rcu/map, rcu/umap);
+        elem_count_.fetch_sub(1, std::memory_order_relaxed);
+        return true;
     }
-    
-    std::cout << "\nFIND with concurrent WRITERS - find ops/sec:\n";
-    std::cout << "Find/Write |   RCU Trie |   std::map |  std::umap | RCU/map | RCU/umap\n";
-    std::cout << "-----------|------------|------------|------------|---------|----------\n";
-    
-    for (auto [f, w] : std::vector<std::pair<int,int>>{{4,0}, {4,1}, {4,2}, {4,4}, {8,0}, {8,2}, {8,4}, {12,0}, {12,4}}) {
-        double rcu = bench_mixed_find<gteitelbaum::tktrie<std::string, int>, decltype(INT_KEYS), int>(INT_KEYS, f, w, MS);
-        double map = bench_mixed_find<locked_map<std::string, int>, decltype(INT_KEYS), int>(INT_KEYS, f, w, MS);
-        double umap = bench_mixed_find<locked_umap<std::string, int>, decltype(INT_KEYS), int>(INT_KEYS, f, w, MS);
-        printf("   %2d / %d | %10.1fM | %10.1fM | %10.1fM | %7.1fx | %8.1fx\n",
-               f, w, rcu/1e6, map/1e6, umap/1e6, rcu/map, rcu/umap);
-    }
-    
-    return 0;
-}
+};
+
+} // namespace gteitelbaum
