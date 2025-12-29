@@ -96,7 +96,7 @@ public:
     }
 };
 
-// ============ String keys data ============
+// ============ String keys test data ============
 
 const std::vector<std::string> WORDS = {
     "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
@@ -198,7 +198,7 @@ const std::vector<std::string> WORDS = {
     "interestingly", "interferometer", "intergovernmental", "intermediary", "intermittently", "internalization", "internationally", "interoperability", "interpretation", "interrelationship"
 };
 
-// ============ uint64_t keys data ============
+// ============ uint64_t keys generation ============
 
 constexpr int NUM_UINT64_KEYS = 100000;
 
@@ -216,61 +216,133 @@ std::vector<uint64_t> generate_uint64_keys() {
 // ============ Benchmark infrastructure ============
 
 std::atomic<long long> total_ops{0};
+std::atomic<int> sink{0};  // Prevent optimization
 
-// String key worker
+// String key workers - interleaved operations, each worker does one type
 template<typename Container>
-void string_worker(Container& c, int thread_id, unsigned seed) {
+void string_find_worker(Container& c, int thread_id, unsigned seed) {
     std::vector<std::string> words = WORDS;
     std::mt19937 rng(seed);
     std::shuffle(words.begin(), words.end(), rng);
     
     long long ops = 0;
-    for (const auto& word : words) {
-        int value = thread_id * 10000 + ops;
-        auto it = c.find(word); (void)it; ops++;
-        c.insert({word, value}); ops++;
-        it = c.find(word); (void)it; ops++;
-        c.erase(word); ops++;
-        it = c.find(word); (void)it; ops++;
-        c.insert({word, value + 1}); ops++;
-        it = c.find(word); (void)it; ops++;
+    int sum = 0;
+    for (int iter = 0; iter < 10; iter++) {
+        for (const auto& word : words) {
+            auto it = c.find(word);
+            if (it != c.end()) sum++;
+            ops++;
+        }
+    }
+    total_ops += ops;
+    sink += sum;
+}
+
+template<typename Container>
+void string_insert_worker(Container& c, int thread_id, unsigned seed) {
+    std::vector<std::string> words = WORDS;
+    std::mt19937 rng(seed);
+    std::shuffle(words.begin(), words.end(), rng);
+    
+    long long ops = 0;
+    for (int iter = 0; iter < 10; iter++) {
+        for (const auto& word : words) {
+            c.insert({word, thread_id * 10000 + (int)ops});
+            ops++;
+        }
     }
     total_ops += ops;
 }
 
-// uint64_t key worker
 template<typename Container>
-void uint64_worker(Container& c, int thread_id, unsigned seed, const std::vector<uint64_t>& keys) {
+void string_erase_worker(Container& c, int thread_id, unsigned seed) {
+    std::vector<std::string> words = WORDS;
+    std::mt19937 rng(seed);
+    std::shuffle(words.begin(), words.end(), rng);
+    
+    long long ops = 0;
+    for (int iter = 0; iter < 10; iter++) {
+        for (const auto& word : words) {
+            c.erase(word);
+            ops++;
+        }
+    }
+    total_ops += ops;
+}
+
+// uint64_t key workers - interleaved operations
+template<typename Container>
+void uint64_find_worker(Container& c, int thread_id, unsigned seed, const std::vector<uint64_t>& keys) {
+    std::vector<uint64_t> local_keys = keys;
+    std::mt19937_64 rng(seed);
+    std::shuffle(local_keys.begin(), local_keys.end(), rng);
+    
+    long long ops = 0;
+    int sum = 0;
+    for (const auto& key : local_keys) {
+        auto it = c.find(key);
+        if (it != c.end()) sum++;
+        ops++;
+    }
+    total_ops += ops;
+    sink += sum;
+}
+
+template<typename Container>
+void uint64_insert_worker(Container& c, int thread_id, unsigned seed, const std::vector<uint64_t>& keys) {
     std::vector<uint64_t> local_keys = keys;
     std::mt19937_64 rng(seed);
     std::shuffle(local_keys.begin(), local_keys.end(), rng);
     
     long long ops = 0;
     for (const auto& key : local_keys) {
-        int value = thread_id * 1000000 + ops;
-        auto it = c.find(key); (void)it; ops++;
-        c.insert({key, value}); ops++;
-        it = c.find(key); (void)it; ops++;
-        c.erase(key); ops++;
-        it = c.find(key); (void)it; ops++;
-        c.insert({key, value + 1}); ops++;
-        it = c.find(key); (void)it; ops++;
+        c.insert({key, thread_id * 1000000 + (int)ops});
+        ops++;
     }
     total_ops += ops;
 }
 
-// Overload for string worker (no extra args)
 template<typename Container>
-double benchmark_string(int num_threads) {
+void uint64_erase_worker(Container& c, int thread_id, unsigned seed, const std::vector<uint64_t>& keys) {
+    std::vector<uint64_t> local_keys = keys;
+    std::mt19937_64 rng(seed);
+    std::shuffle(local_keys.begin(), local_keys.end(), rng);
+    
+    long long ops = 0;
+    for (const auto& key : local_keys) {
+        c.erase(key);
+        ops++;
+    }
+    total_ops += ops;
+}
+
+// Run all three operation types in parallel: N threads each for find, insert, erase
+template<typename Container>
+double benchmark_string_parallel(int threads_per_op) {
     Container c;
     total_ops = 0;
+    
+    // Prefill with some data
+    for (size_t i = 0; i < WORDS.size(); i++) {
+        c.insert({WORDS[i], (int)i});
+    }
     
     std::vector<std::thread> threads;
     auto start = std::chrono::high_resolution_clock::now();
     
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(string_worker<Container>, std::ref(c), i, i * 12345);
+    // Launch find workers
+    for (int i = 0; i < threads_per_op; ++i) {
+        threads.emplace_back(string_find_worker<Container>, std::ref(c), i, i * 11111);
     }
+    // Launch insert workers
+    for (int i = 0; i < threads_per_op; ++i) {
+        threads.emplace_back(string_insert_worker<Container>, std::ref(c), i + 100, i * 22222);
+    }
+    // Launch erase workers
+    for (int i = 0; i < threads_per_op; ++i) {
+        threads.emplace_back(string_erase_worker<Container>, std::ref(c), i + 200, i * 33333);
+    }
+    
     for (auto& t : threads) t.join();
     
     auto end = std::chrono::high_resolution_clock::now();
@@ -279,18 +351,32 @@ double benchmark_string(int num_threads) {
     return total_ops.load() * 1000000.0 / duration.count();
 }
 
-// Overload for uint64 worker
 template<typename Container>
-double benchmark_uint64(int num_threads, const std::vector<uint64_t>& keys) {
+double benchmark_uint64_parallel(int threads_per_op, const std::vector<uint64_t>& keys) {
     Container c;
     total_ops = 0;
+    
+    // Prefill with some data
+    for (size_t i = 0; i < keys.size(); i++) {
+        c.insert({keys[i], (int)i});
+    }
     
     std::vector<std::thread> threads;
     auto start = std::chrono::high_resolution_clock::now();
     
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(uint64_worker<Container>, std::ref(c), i, i * 12345, std::cref(keys));
+    // Launch find workers
+    for (int i = 0; i < threads_per_op; ++i) {
+        threads.emplace_back(uint64_find_worker<Container>, std::ref(c), i, i * 11111, std::cref(keys));
     }
+    // Launch insert workers
+    for (int i = 0; i < threads_per_op; ++i) {
+        threads.emplace_back(uint64_insert_worker<Container>, std::ref(c), i + 100, i * 22222, std::cref(keys));
+    }
+    // Launch erase workers
+    for (int i = 0; i < threads_per_op; ++i) {
+        threads.emplace_back(uint64_erase_worker<Container>, std::ref(c), i + 200, i * 33333, std::cref(keys));
+    }
+    
     for (auto& t : threads) t.join();
     
     auto end = std::chrono::high_resolution_clock::now();
@@ -299,33 +385,30 @@ double benchmark_uint64(int num_threads, const std::vector<uint64_t>& keys) {
     return total_ops.load() * 1000000.0 / duration.count();
 }
 
-int main(int argc, char* argv[]) {
+int main() {
     auto uint64_keys = generate_uint64_keys();
     
-    // Warm up
-    benchmark_string<gteitelbaum::tktrie<std::string, int>>(2);
-    benchmark_string<locked_map<std::string, int>>(2);
-    benchmark_string<locked_unordered_map<std::string, int>>(2);
-    benchmark_uint64<tktrie_uint64<int>>(2, uint64_keys);
-    benchmark_uint64<locked_map<uint64_t, int>>(2, uint64_keys);
-    benchmark_uint64<locked_unordered_map<uint64_t, int>>(2, uint64_keys);
+    // Warmup
+    benchmark_string_parallel<gteitelbaum::tktrie<std::string, int>>(2);
+    benchmark_uint64_parallel<tktrie_uint64<int>>(2, uint64_keys);
     
-    // String tests
-    std::cout << "STRING " << WORDS.size() << std::endl;
-    for (int threads : {1, 2, 4, 8, 16}) {
-        double trie = benchmark_string<gteitelbaum::tktrie<std::string, int>>(threads);
-        double map = benchmark_string<locked_map<std::string, int>>(threads);
-        double umap = benchmark_string<locked_unordered_map<std::string, int>>(threads);
-        std::cout << threads << " " << (long)trie << " " << (long)map << " " << (long)umap << std::endl;
+    // String benchmarks - parallel find/insert/erase
+    // threads_per_op means total threads = 3 * threads_per_op
+    std::cout << "STRING_PARALLEL:" << WORDS.size() << std::endl;
+    for (int tpo : {1, 2, 4, 5}) {  // 3, 6, 12, 15 total threads
+        double trie = benchmark_string_parallel<gteitelbaum::tktrie<std::string, int>>(tpo);
+        double map = benchmark_string_parallel<locked_map<std::string, int>>(tpo);
+        double umap = benchmark_string_parallel<locked_unordered_map<std::string, int>>(tpo);
+        std::cout << tpo*3 << "," << (long)trie << "," << (long)map << "," << (long)umap << std::endl;
     }
     
-    // uint64 tests
-    std::cout << "UINT64 " << NUM_UINT64_KEYS << std::endl;
-    for (int threads : {1, 2, 4, 8, 16}) {
-        double trie = benchmark_uint64<tktrie_uint64<int>>(threads, uint64_keys);
-        double map = benchmark_uint64<locked_map<uint64_t, int>>(threads, uint64_keys);
-        double umap = benchmark_uint64<locked_unordered_map<uint64_t, int>>(threads, uint64_keys);
-        std::cout << threads << " " << (long)trie << " " << (long)map << " " << (long)umap << std::endl;
+    // uint64 benchmarks - parallel find/insert/erase
+    std::cout << "UINT64_PARALLEL:" << NUM_UINT64_KEYS << std::endl;
+    for (int tpo : {1, 2, 4, 5}) {
+        double trie = benchmark_uint64_parallel<tktrie_uint64<int>>(tpo, uint64_keys);
+        double map = benchmark_uint64_parallel<locked_map<uint64_t, int>>(tpo, uint64_keys);
+        double umap = benchmark_uint64_parallel<locked_unordered_map<uint64_t, int>>(tpo, uint64_keys);
+        std::cout << tpo*3 << "," << (long)trie << "," << (long)map << "," << (long)umap << std::endl;
     }
     
     return 0;
