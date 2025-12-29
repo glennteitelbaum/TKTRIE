@@ -365,19 +365,25 @@ private:
 
             // Case 2: Key is prefix of current node - split needed
             if (common == kv_len) {
-                // Prepare split data before locking
-                std::string new_skip = std::string(skip.substr(0, common));
+                // Prepare everything BEFORE locking
+                std::string new_cur_skip = std::string(skip.substr(0, common));
                 std::string child_skip = std::string(skip.substr(common + 1));
                 char edge_char = skip[common];
                 
-                // Create child node BEFORE locking
+                // Create and fully initialize child node
                 auto* child = new node_type();
                 child->skip = std::move(child_skip);
                 child->parent_edge = edge_char;
+                child->has_data = true;  // Will swap with cur
+                child->data = value;     // New value goes here temporarily
                 
-                // Prepare a vector with one slot
-                std::vector<node_type*> new_children;
-                new_children.reserve(1);
+                // Prepare new children vector for cur
+                std::vector<node_type*> new_cur_children;
+                new_cur_children.push_back(child);
+                
+                // Prepare new pop for cur
+                pop_tp new_cur_pop{};
+                new_cur_pop.set_bit(edge_char);
                 
                 cur->read_unlock();
                 cur->write_lock();
@@ -394,32 +400,31 @@ private:
                     return insert_internal(key, value);
                 }
                 
-                // Complete child setup with cur's data (moves, no alloc)
-                child->has_data = cur->has_data;
-                child->data = std::move(cur->data);
-                child->children = std::move(cur->children);
-                child->pop = cur->pop;
+                // Inside lock: only swaps and pointer updates
+                // Swap data: cur gets new value, child gets old value
+                std::swap(child->has_data, cur->has_data);
+                std::swap(child->data, cur->data);
+                
+                // Child takes cur's children and pop
+                child->children.swap(cur->children);
+                std::swap(child->pop, cur->pop);
                 child->parent = cur;
+                
+                // Update grandchildren parent pointers
                 for (auto* gc : child->children) if (gc) gc->parent = child;
                 
-                // Swap skip - defer old string destruction
-                std::string old_skip;
-                old_skip.swap(cur->skip);
-                cur->skip = std::move(new_skip);
+                // Cur gets new skip (swap to defer destruction)
+                cur->skip.swap(new_cur_skip);
                 
-                cur->has_data = true;
-                cur->data = value;
-                
-                // cur->children is already empty from the move above
-                cur->pop = pop_tp{};
-                int idx = cur->pop.set_bit(child->parent_edge);
-                new_children.push_back(child);
-                cur->children = std::move(new_children);
+                // Cur gets new children vector and pop
+                cur->children.swap(new_cur_children);
+                cur->pop = new_cur_pop;
                 
                 elem_count.fetch_add(1, std::memory_order_relaxed);
                 cur->write_unlock();
                 
-                // old_skip destroyed here, outside lock
+                // new_cur_skip (old cur->skip) destroyed here
+                // new_cur_children (empty) destroyed here
                 return {iterator(cur, key), true};
             }
 
@@ -466,26 +471,40 @@ private:
             }
 
             // Case 4: Mismatch in skip - split node
-            // Prepare both new nodes BEFORE locking
+            // Prepare everything BEFORE locking
             std::string old_child_skip = std::string(skip.substr(common + 1));
             std::string new_child_skip = std::string(kv.substr(common + 1));
             std::string new_cur_skip = std::string(skip.substr(0, common));
             char old_edge = skip[common];
             char new_edge = kv[common];
             
+            // Create old_child - will receive cur's data via swap
             auto* old_child = new node_type();
             old_child->skip = std::move(old_child_skip);
             old_child->parent_edge = old_edge;
+            old_child->has_data = false;  // Will swap with cur
             
+            // Create new_child - fully initialized
             auto* new_child = new node_type();
             new_child->skip = std::move(new_child_skip);
             new_child->has_data = true;
             new_child->data = value;
             new_child->parent_edge = new_edge;
             
-            // Pre-allocate vector for 2 children
-            std::vector<node_type*> new_children;
-            new_children.reserve(2);
+            // Pre-build children vector and pop
+            pop_tp new_cur_pop{};
+            int i1 = new_cur_pop.set_bit(old_edge);
+            int i2 = new_cur_pop.set_bit(new_edge);
+            
+            std::vector<node_type*> new_cur_children;
+            new_cur_children.reserve(2);
+            if (i1 <= i2) {
+                new_cur_children.push_back(old_child);
+                new_cur_children.push_back(new_child);
+            } else {
+                new_cur_children.push_back(new_child);
+                new_cur_children.push_back(old_child);
+            }
             
             cur->read_unlock();
             cur->write_lock();
@@ -497,50 +516,35 @@ private:
                    skip2[common2] == kv[common2]) ++common2;
                    
             if (common2 == skip2.size()) {
-                // State changed - discard prepared nodes after unlock
                 cur->write_unlock();
                 delete old_child;
                 delete new_child;
                 return insert_internal(key, value);
             }
             
-            // Complete old_child setup with cur's data (moves, no alloc)
-            old_child->has_data = cur->has_data;
-            old_child->data = std::move(cur->data);
-            old_child->children = std::move(cur->children);
-            old_child->pop = cur->pop;
-            old_child->parent = cur;
-            for (auto* gc : old_child->children) if (gc) gc->parent = old_child;
+            // Inside lock: only swaps and pointer updates
+            // old_child takes cur's data via swap
+            std::swap(old_child->has_data, cur->has_data);
+            std::swap(old_child->data, cur->data);
             
-            // Complete new_child setup
+            // old_child takes cur's children and pop via swap
+            old_child->children.swap(cur->children);
+            std::swap(old_child->pop, cur->pop);
+            old_child->parent = cur;
             new_child->parent = cur;
             
-            // Swap skip - defer old string destruction
-            std::string old_skip;
-            old_skip.swap(cur->skip);
-            cur->skip = std::move(new_cur_skip);
+            // Update grandchildren parent pointers
+            for (auto* gc : old_child->children) if (gc) gc->parent = old_child;
             
-            cur->has_data = false;
-            // Don't assign T{} - just leave moved-from state
-            
-            // Build new children vector (cur->children already moved out)
-            cur->pop = pop_tp{};
-            int i1 = cur->pop.set_bit(old_child->parent_edge);
-            int i2 = cur->pop.set_bit(new_child->parent_edge);
-            // Insert in correct order
-            if (i1 <= i2) {
-                new_children.push_back(old_child);
-                new_children.push_back(new_child);
-            } else {
-                new_children.push_back(new_child);
-                new_children.push_back(old_child);
-            }
-            cur->children = std::move(new_children);
+            // cur gets new skip, children, pop via swap
+            cur->skip.swap(new_cur_skip);
+            cur->children.swap(new_cur_children);
+            cur->pop = new_cur_pop;
             
             elem_count.fetch_add(1, std::memory_order_relaxed);
             cur->write_unlock();
             
-            // old_skip destroyed here, outside lock
+            // new_cur_skip (old cur->skip), new_cur_children (empty) destroyed here
             return {iterator(new_child, key), true};
         }
     }
