@@ -12,7 +12,7 @@
 #include <vector>
 #include <thread>
 
-namespace rcu {
+namespace gteitelbaum {
 
 // Simple deferred deletion using a retire list
 // In production, use proper epoch-based reclamation
@@ -352,4 +352,4 @@ private:
     }
 };
 
-} // namespace rcu
+} // namespace gteitelbaum
