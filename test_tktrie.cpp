@@ -2,7 +2,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -15,7 +14,8 @@
 
 #include "tktrie.h"
 
-// ============== uint64_t key adapter ==============
+// ============ uint64_t key support ============
+
 inline uint64_t byteswap64(uint64_t x) {
     return __builtin_bswap64(x);
 }
@@ -46,7 +46,8 @@ public:
 template<typename V>
 thread_local std::string tktrie_uint64<V>::buf_;
 
-// ============== Locked container wrappers ==============
+// ============ Locked container wrappers ============
+
 template<typename K, typename V>
 class locked_map {
     std::map<K, V> data;
@@ -95,7 +96,8 @@ public:
     }
 };
 
-// ============== 1000 English words ==============
+// ============ String keys data ============
+
 const std::vector<std::string> WORDS = {
     "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
     "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
@@ -196,14 +198,10 @@ const std::vector<std::string> WORDS = {
     "interestingly", "interferometer", "intergovernmental", "intermediary", "intermittently", "internalization", "internationally", "interoperability", "interpretation", "interrelationship"
 };
 
-// ============== Benchmark infrastructure ==============
-constexpr int STRING_ITERATIONS = 10;
-constexpr int UINT64_ITERATIONS = 1;
+// ============ uint64_t keys data ============
+
 constexpr int NUM_UINT64_KEYS = 100000;
 
-std::atomic<long long> total_ops{0};
-
-// Generate random uint64 keys
 std::vector<uint64_t> generate_uint64_keys() {
     std::vector<uint64_t> keys;
     keys.reserve(NUM_UINT64_KEYS);
@@ -215,7 +213,11 @@ std::vector<uint64_t> generate_uint64_keys() {
     return keys;
 }
 
-// String worker
+// ============ Benchmark infrastructure ============
+
+std::atomic<long long> total_ops{0};
+
+// String key worker
 template<typename Container>
 void string_worker(Container& c, int thread_id, unsigned seed) {
     std::vector<std::string> words = WORDS;
@@ -223,22 +225,20 @@ void string_worker(Container& c, int thread_id, unsigned seed) {
     std::shuffle(words.begin(), words.end(), rng);
     
     long long ops = 0;
-    for (int iter = 0; iter < STRING_ITERATIONS; ++iter) {
-        for (const auto& word : words) {
-            int value = thread_id * 10000 + ops;
-            auto it = c.find(word); (void)it; ops++;
-            c.insert({word, value}); ops++;
-            it = c.find(word); (void)it; ops++;
-            c.erase(word); ops++;
-            it = c.find(word); (void)it; ops++;
-            c.insert({word, value + 1}); ops++;
-            it = c.find(word); (void)it; ops++;
-        }
+    for (const auto& word : words) {
+        int value = thread_id * 10000 + ops;
+        auto it = c.find(word); (void)it; ops++;
+        c.insert({word, value}); ops++;
+        it = c.find(word); (void)it; ops++;
+        c.erase(word); ops++;
+        it = c.find(word); (void)it; ops++;
+        c.insert({word, value + 1}); ops++;
+        it = c.find(word); (void)it; ops++;
     }
     total_ops += ops;
 }
 
-// uint64 worker
+// uint64_t key worker
 template<typename Container>
 void uint64_worker(Container& c, int thread_id, unsigned seed, const std::vector<uint64_t>& keys) {
     std::vector<uint64_t> local_keys = keys;
@@ -246,22 +246,20 @@ void uint64_worker(Container& c, int thread_id, unsigned seed, const std::vector
     std::shuffle(local_keys.begin(), local_keys.end(), rng);
     
     long long ops = 0;
-    for (int iter = 0; iter < UINT64_ITERATIONS; ++iter) {
-        for (const auto& key : local_keys) {
-            int value = thread_id * 1000000 + ops;
-            auto it = c.find(key); (void)it; ops++;
-            c.insert({key, value}); ops++;
-            it = c.find(key); (void)it; ops++;
-            c.erase(key); ops++;
-            it = c.find(key); (void)it; ops++;
-            c.insert({key, value + 1}); ops++;
-            it = c.find(key); (void)it; ops++;
-        }
+    for (const auto& key : local_keys) {
+        int value = thread_id * 1000000 + ops;
+        auto it = c.find(key); (void)it; ops++;
+        c.insert({key, value}); ops++;
+        it = c.find(key); (void)it; ops++;
+        c.erase(key); ops++;
+        it = c.find(key); (void)it; ops++;
+        c.insert({key, value + 1}); ops++;
+        it = c.find(key); (void)it; ops++;
     }
     total_ops += ops;
 }
 
-// String benchmark
+// Overload for string worker (no extra args)
 template<typename Container>
 double benchmark_string(int num_threads) {
     Container c;
@@ -277,10 +275,11 @@ double benchmark_string(int num_threads) {
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    
     return total_ops.load() * 1000000.0 / duration.count();
 }
 
-// uint64 benchmark
+// Overload for uint64 worker
 template<typename Container>
 double benchmark_uint64(int num_threads, const std::vector<uint64_t>& keys) {
     Container c;
@@ -296,97 +295,38 @@ double benchmark_uint64(int num_threads, const std::vector<uint64_t>& keys) {
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    
     return total_ops.load() * 1000000.0 / duration.count();
 }
 
-struct Stats {
-    double mean;
-    double range;  // (max - min) / 2
-};
-
-Stats compute_stats(const std::vector<double>& data) {
-    double sum = 0, minv = data[0], maxv = data[0];
-    for (double v : data) {
-        sum += v;
-        minv = std::min(minv, v);
-        maxv = std::max(maxv, v);
-    }
-    return {sum / data.size(), (maxv - minv) / 2};
-}
-
-int main() {
+int main(int argc, char* argv[]) {
     auto uint64_keys = generate_uint64_keys();
-    constexpr int RUNS = 10;
-    std::vector<int> thread_counts = {1, 2, 4, 8, 16};
     
-    // Storage for results: [thread_idx][run]
-    std::vector<std::vector<double>> str_trie(5), str_map(5), str_umap(5);
-    std::vector<std::vector<double>> u64_trie(5), u64_map(5), u64_umap(5);
+    // Warm up
+    benchmark_string<gteitelbaum::tktrie<std::string, int>>(2);
+    benchmark_string<locked_map<std::string, int>>(2);
+    benchmark_string<locked_unordered_map<std::string, int>>(2);
+    benchmark_uint64<tktrie_uint64<int>>(2, uint64_keys);
+    benchmark_uint64<locked_map<uint64_t, int>>(2, uint64_keys);
+    benchmark_uint64<locked_unordered_map<uint64_t, int>>(2, uint64_keys);
     
-    std::cerr << "Running " << RUNS << " iterations..." << std::endl;
-    
-    // Warmup
-    benchmark_string<gteitelbaum::tktrie<std::string, int>>(4);
-    benchmark_uint64<tktrie_uint64<int>>(4, uint64_keys);
-    
-    for (int run = 0; run < RUNS; ++run) {
-        std::cerr << "Run " << (run + 1) << "/" << RUNS << std::endl;
-        
-        for (size_t ti = 0; ti < thread_counts.size(); ++ti) {
-            int t = thread_counts[ti];
-            
-            // String benchmarks
-            str_trie[ti].push_back(benchmark_string<gteitelbaum::tktrie<std::string, int>>(t));
-            str_map[ti].push_back(benchmark_string<locked_map<std::string, int>>(t));
-            str_umap[ti].push_back(benchmark_string<locked_unordered_map<std::string, int>>(t));
-            
-            // uint64 benchmarks
-            u64_trie[ti].push_back(benchmark_uint64<tktrie_uint64<int>>(t, uint64_keys));
-            u64_map[ti].push_back(benchmark_uint64<locked_map<uint64_t, int>>(t, uint64_keys));
-            u64_umap[ti].push_back(benchmark_uint64<locked_unordered_map<uint64_t, int>>(t, uint64_keys));
-        }
+    // String tests
+    std::cout << "STRING " << WORDS.size() << std::endl;
+    for (int threads : {1, 2, 4, 8, 16}) {
+        double trie = benchmark_string<gteitelbaum::tktrie<std::string, int>>(threads);
+        double map = benchmark_string<locked_map<std::string, int>>(threads);
+        double umap = benchmark_string<locked_unordered_map<std::string, int>>(threads);
+        std::cout << threads << " " << (long)trie << " " << (long)map << " " << (long)umap << std::endl;
     }
     
-    // Output results
-    std::cout << std::fixed << std::setprecision(0);
-    
-    std::cout << "## Strings (" << WORDS.size() << " words)\n\n";
-    std::cout << "| Threads | tktrie | +/- | std::map | +/- | std::unordered_map | +/- | trie/map | trie/umap |\n";
-    std::cout << "|--------:|-------:|----:|---------:|----:|-------------------:|----:|---------:|----------:|\n";
-    
-    for (size_t ti = 0; ti < thread_counts.size(); ++ti) {
-        Stats st = compute_stats(str_trie[ti]);
-        Stats sm = compute_stats(str_map[ti]);
-        Stats su = compute_stats(str_umap[ti]);
-        
-        std::cout << "| " << thread_counts[ti]
-                  << " | " << (long)st.mean << " | " << (long)st.range
-                  << " | " << (long)sm.mean << " | " << (long)sm.range
-                  << " | " << (long)su.mean << " | " << (long)su.range
-                  << " | " << std::setprecision(2) << (st.mean / sm.mean) << "x"
-                  << " | " << (st.mean / su.mean) << "x |\n";
-        std::cout << std::setprecision(0);
+    // uint64 tests
+    std::cout << "UINT64 " << NUM_UINT64_KEYS << std::endl;
+    for (int threads : {1, 2, 4, 8, 16}) {
+        double trie = benchmark_uint64<tktrie_uint64<int>>(threads, uint64_keys);
+        double map = benchmark_uint64<locked_map<uint64_t, int>>(threads, uint64_keys);
+        double umap = benchmark_uint64<locked_unordered_map<uint64_t, int>>(threads, uint64_keys);
+        std::cout << threads << " " << (long)trie << " " << (long)map << " " << (long)umap << std::endl;
     }
-    
-    std::cout << "\n## uint64_t (" << NUM_UINT64_KEYS << " random keys)\n\n";
-    std::cout << "| Threads | tktrie | +/- | std::map | +/- | std::unordered_map | +/- | trie/map | trie/umap |\n";
-    std::cout << "|--------:|-------:|----:|---------:|----:|-------------------:|----:|---------:|----------:|\n";
-    
-    for (size_t ti = 0; ti < thread_counts.size(); ++ti) {
-        Stats st = compute_stats(u64_trie[ti]);
-        Stats sm = compute_stats(u64_map[ti]);
-        Stats su = compute_stats(u64_umap[ti]);
-        
-        std::cout << "| " << thread_counts[ti]
-                  << " | " << (long)st.mean << " | " << (long)st.range
-                  << " | " << (long)sm.mean << " | " << (long)sm.range
-                  << " | " << (long)su.mean << " | " << (long)su.range
-                  << " | " << std::setprecision(2) << (st.mean / sm.mean) << "x"
-                  << " | " << (st.mean / su.mean) << "x |\n";
-        std::cout << std::setprecision(0);
-    }
-    
-    std::cout << "\n(ops/sec - higher is better)\n";
     
     return 0;
 }
