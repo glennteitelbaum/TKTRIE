@@ -116,6 +116,8 @@ const std::vector<std::string> WORDS = {
 
 constexpr int ITERATIONS = 10;
 
+namespace gteitelbaum {
+
 // Locked std::map wrapper
 template<typename K, typename V>
 class locked_map {
@@ -165,6 +167,8 @@ public:
         return data.size();
     }
 };
+
+} // namespace gteitelbaum
 
 std::atomic<long long> total_ops{0};
 
@@ -219,18 +223,18 @@ int main() {
     std::cout << " | Ops per thread: " << WORDS.size() * 7 * ITERATIONS << "\n\n";
     
     // Warm up
-    benchmark<tktrie<std::string, int>>("warmup", 4);
-    benchmark<locked_map<std::string, int>>("warmup", 4);
-    benchmark<locked_unordered_map<std::string, int>>("warmup", 4);
+    benchmark<gteitelbaum::tktrie<std::string, int>>("warmup", 4);
+    benchmark<gteitelbaum::locked_map<std::string, int>>("warmup", 4);
+    benchmark<gteitelbaum::locked_unordered_map<std::string, int>>("warmup", 4);
     
     std::cout << std::fixed << std::setprecision(0);
     std::cout << "Threads |     tktrie     |    std::map    | std::unordered | trie/map | trie/umap\n";
     std::cout << "--------|----------------|----------------|----------------|----------|----------\n";
     
     for (int threads : {1, 2, 4, 8, 16}) {
-        double trie = benchmark<tktrie<std::string, int>>("tktrie", threads);
-        double map = benchmark<locked_map<std::string, int>>("map", threads);
-        double umap = benchmark<locked_unordered_map<std::string, int>>("umap", threads);
+        double trie = benchmark<gteitelbaum::tktrie<std::string, int>>("tktrie", threads);
+        double map = benchmark<gteitelbaum::locked_map<std::string, int>>("map", threads);
+        double umap = benchmark<gteitelbaum::locked_unordered_map<std::string, int>>("umap", threads);
         
         std::cout << std::setw(7) << threads << " | "
                   << std::setw(14) << (long)trie << " | "
