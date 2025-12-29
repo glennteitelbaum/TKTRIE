@@ -3,6 +3,8 @@ Thread optimized vs stp::map and std::unordered map with global mutex
 
 ## tktrie Benchmark Results (10 Runs Averaged)
 
+Test of 1000 std::strings
+
 ### Raw Performance (ops/sec)
 
 | Threads | tktrie | std::map | std::unordered_map | trie/map | trie/umap |
@@ -13,24 +15,17 @@ Thread optimized vs stp::map and std::unordered map with global mutex
 | 8 | 6,730,150 | 765,390 | 1,132,692 | 8.52x | 5.94x |
 | 16 | 2,887,377 | 685,456 | 1,088,412 | 4.25x | 2.65x |
 
-### Per-Run Data
+### Single-Threaded Performance (No Locks)
+| Container | ops/sec | vs tktrie |
+|-----------|--------:|----------:|
+| tktrie | 14,760,839 | 100% |
+| std::map | 14,086,580 | 95% |
+| std::unordered_map | 37,268,632 | 252% |
 
-| Run | 1T tktrie | 2T tktrie | 4T tktrie | 8T tktrie | 16T tktrie |
-|----:|----------:|----------:|----------:|----------:|-----------:|
-| 1 | 5,348,983 | 9,829,895 | 6,090,642 | 3,906,199 | 2,559,583 |
-| 2 | 6,459,284 | 4,910,326 | 6,163,761 | 7,596,777 | 2,844,500 |
-| 3 | 6,043,613 | 8,927,162 | 5,902,551 | 4,668,311 | 2,589,811 |
-| 4 | 5,548,745 | 10,083,160 | 9,153,719 | 9,657,232 | 3,082,055 |
-| 5 | 4,958,013 | 9,874,927 | 10,181,818 | 6,840,706 | 2,772,156 |
-| 6 | 5,847,399 | 9,755,046 | 10,076,052 | 7,533,249 | 3,203,037 |
-| 7 | 5,114,877 | 9,780,338 | 9,139,857 | 5,828,388 | 2,872,880 |
-| 8 | 5,829,827 | 4,739,799 | 9,627,791 | 7,160,558 | 3,790,371 |
-| 9 | 6,578,182 | 9,659,980 | 9,613,818 | 8,187,874 | 2,749,231 |
-| 10 | 5,433,738 | 9,930,530 | 10,073,810 | 6,282,310 | 2,770,149 |
 
 ### Key Observations
 
-- **Single-threaded**: tktrie slower due to locking overhead
+- **Single-threaded**: tktrie with locks slower due to locking overhead
 - **Sweet spot**: 4-8 threads
 - **Peak throughput**: ~10M ops/sec at 2-4 threads
 - **Scalability**: Maintains advantage even at 16 threads
