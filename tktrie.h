@@ -15,13 +15,17 @@
 
 namespace gteitelbaum {
 
-template <typename U>
-U do_byteswap(U inp) {
-    if constexpr (std::endian::native == std::endian::big) return inp;
-    if constexpr (sizeof(U) == 1) return inp;
-    else if constexpr (sizeof(U) == 2) return static_cast<U>(__builtin_bswap16(static_cast<uint16_t>(inp)));
-    else if constexpr (sizeof(U) == 4) return static_cast<U>(__builtin_bswap32(static_cast<uint32_t>(inp)));
-    else if constexpr (sizeof(U) == 8) return static_cast<U>(__builtin_bswap64(static_cast<uint64_t>(inp)));
+template <typename T>
+constexpr T my_byteswap(T value) noexcept {
+    if constexpr (std::endian::native == std::endian::big) return value;
+#if __cpp_lib_byteswap >= 202110L
+    return std::byteswap(value);
+#else
+    if constexpr (sizeof(T) == 1) return value;
+    else if constexpr (sizeof(T) == 2) return static_cast<T>(__builtin_bswap16(static_cast<uint16_t>(value)));
+    else if constexpr (sizeof(T) == 4) return static_cast<T>(__builtin_bswap32(static_cast<uint32_t>(value)));
+    else if constexpr (sizeof(T) == 8) return static_cast<T>(__builtin_bswap64(static_cast<uint64_t>(value)));
+#endif
 }
 
 template <typename Key> struct tktrie_traits;
@@ -42,14 +46,14 @@ struct tktrie_traits<T> {
         if constexpr (std::is_signed_v<T>) {
             sortable = static_cast<unsigned_type>(k) + (unsigned_type{1} << (sizeof(T) * 8 - 1));
         } else { sortable = k; }
-        unsigned_type be = do_byteswap(sortable);
+        unsigned_type be = my_byteswap(sortable);
         std::memcpy(buf, &be, sizeof(T));
         return std::string(buf, sizeof(T));
     }
     static T from_bytes(std::string_view s) {
         unsigned_type be;
         std::memcpy(&be, s.data(), sizeof(T));
-        unsigned_type sortable = do_byteswap(be);
+        unsigned_type sortable = my_byteswap(be);
         if constexpr (std::is_signed_v<T>) {
             return static_cast<T>(sortable - (unsigned_type{1} << (sizeof(T) * 8 - 1)));
         } else { return static_cast<T>(sortable); }
