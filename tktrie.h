@@ -135,7 +135,7 @@ public:
     using Traits = tktrie_traits<Key>;
     static constexpr size_t fixed_len = Traits::fixed_len;
     static constexpr bool is_fixed = (fixed_len > 0);
-    using node_type = std::conditional_t<is_fixed, Node<T>, Node<T>>;
+    using node_type = Node<T>;
     using size_type = std::size_t;
     using iterator = tktrie_iterator<Key, T>;
 
