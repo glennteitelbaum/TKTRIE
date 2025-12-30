@@ -115,19 +115,18 @@ template <typename T> struct Node {
     PopCount pop{};
     std::vector<Node*> children{};
     std::string skip{};
-    T* data{nullptr};  // nullptr = no data, otherwise points to allocated T
+    T* data{nullptr};  // nullptr = no data
     
     Node() = default;
-    Node(const Node& o) : pop(o.pop), children(o.children), skip(o.skip), 
-                          data(o.data ? new T(*o.data) : nullptr) {}
+    // COW copy: copy structure but NOT data (data transferred separately)
+    Node(const Node& o) : pop(o.pop), children(o.children), skip(o.skip), data(nullptr) {}
     ~Node() { delete data; }
     
     bool has_data() const { return data != nullptr; }
-    void set_data(const T& val) { 
-        if (data) *data = val;
-        else data = new T(val);
-    }
-    void clear_data() { delete data; data = nullptr; }
+    void set_data(const T& val) { data = new T(val); }
+    void clear_data() { data = nullptr; }
+    // Transfer data ownership from src to this
+    void take_data(Node& src) { data = src.data; src.data = nullptr; }
     
     Node* get_child(unsigned char c) const { int idx; return pop.find(c, &idx) ? children[idx] : nullptr; }
     bool get_child_idx(unsigned char c, int* idx) const { return pop.find(c, idx); }
@@ -158,6 +157,7 @@ private:
         node_type* child = new_node;
         for (int i = (int)path.size() - 1; i >= 0; i--) {
             node_type* new_parent = new node_type(*path[i].node);
+            new_parent->take_data(*path[i].node);  // Transfer data ownership
             new_parent->children[path[i].child_idx] = child;
             retired_.retire(path[i].node);
             child = new_parent;
@@ -173,6 +173,7 @@ private:
         Node<T>* child = new_node;
         for (int i = change_depth - 1; i >= 0; i--) {
             Node<T>* new_parent = new Node<T>(*nodes[i]);
+            new_parent->take_data(*nodes[i]);  // Transfer data ownership
             new_parent->children[indices[i]] = child;
             retired_.retire(nodes[i]);
             child = new_parent;
@@ -183,7 +184,7 @@ private:
     void delete_tree(node_type* n) {
         if (!n) return;
         for (auto* c : n->children) delete_tree(c);
-        delete n;
+        delete n;  // Destructor deletes data
     }
 
 public:
@@ -262,6 +263,7 @@ private:
                 n->skip = cur->skip.substr(0, common);
                 
                 Node<T>* old_suffix = new Node<T>(*cur);
+                old_suffix->take_data(*cur);  // Transfer data ownership
                 old_suffix->skip = cur->skip.substr(common + 1);
                 
                 if (common == kv.size()) {
@@ -297,6 +299,7 @@ private:
             if (kv.empty()) {
                 if (cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
+                // No take_data - cur has no data (checked above), n gets new data
                 n->set_data(value);
                 commit_path(path, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
@@ -313,6 +316,7 @@ private:
             }
             
             Node<T>* n = new Node<T>(*cur);
+            n->take_data(*cur);  // Transfer data ownership
             Node<T>* child = new Node<T>();
             child->skip = std::string(kv.substr(1));
             child->set_data(value);
@@ -411,6 +415,7 @@ private:
                 Node<T>* n = new Node<T>();
                 n->skip = cur->skip.substr(0, common);
                 Node<T>* os = new Node<T>(*cur);
+                os->take_data(*cur);  // Transfer data ownership
                 os->skip = cur->skip.substr(common + 1);
                 Node<T>* nc = new Node<T>();
                 nc->skip = kv.substr(pos + common + 1);
@@ -435,6 +440,7 @@ private:
             if (pos == kv.size()) {
                 if (cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
+                // No take_data - cur has no data (checked above)
                 n->set_data(value);
                 commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
@@ -444,6 +450,7 @@ private:
             unsigned char c = (unsigned char)kv[pos]; int idx;
             if (!cur->pop.find(c, &idx)) {
                 Node<T>* n = new Node<T>(*cur);
+                n->take_data(*cur);  // Transfer data ownership
                 Node<T>* ch = new Node<T>();
                 ch->skip = kv.substr(pos + 1);
                 ch->set_data(value);
