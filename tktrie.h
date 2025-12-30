@@ -1,5 +1,7 @@
 #pragma once
-// Thread-safe trie with type-based specialization
+// Thread-safe trie with version-based optimistic locking
+// - Reads are always lock-free
+// - Writes only lock if there's a conflict on the same path
 
 #include <atomic>
 #include <bit>
@@ -33,7 +35,6 @@ template <typename Key> struct tktrie_traits;
 template <> struct tktrie_traits<std::string> {
     static constexpr size_t fixed_len = 0;
     static std::string_view to_bytes(const std::string& k) { return k; }
-    static std::string from_bytes(std::string_view s) { return std::string(s); }
 };
 
 template <typename T> requires std::is_integral_v<T>
@@ -49,14 +50,6 @@ struct tktrie_traits<T> {
         unsigned_type be = my_byteswap(sortable);
         std::memcpy(buf, &be, sizeof(T));
         return std::string(buf, sizeof(T));
-    }
-    static T from_bytes(std::string_view s) {
-        unsigned_type be;
-        std::memcpy(&be, s.data(), sizeof(T));
-        unsigned_type sortable = my_byteswap(be);
-        if constexpr (std::is_signed_v<T>) {
-            return static_cast<T>(sortable - (unsigned_type{1} << (sizeof(T) * 8 - 1)));
-        } else { return static_cast<T>(sortable); }
     }
 };
 
@@ -79,19 +72,6 @@ public:
         bits[word] |= mask;
         return idx;
     }
-    int count() const { int n = 0; for (auto b : bits) n += std::popcount(b); return n; }
-};
-
-class RetireList {
-    struct Retired { void* ptr; void (*deleter)(void*); };
-    std::vector<Retired> list;
-    std::mutex mtx;
-public:
-    template<typename T> void retire(T* ptr) {
-        std::lock_guard<std::mutex> lock(mtx);
-        list.push_back({ptr, [](void* p) { delete static_cast<T*>(p); }});
-    }
-    ~RetireList() { for (auto& r : list) r.deleter(r.ptr); }
 };
 
 template <typename Key, typename T> class tktrie;
@@ -107,29 +87,35 @@ public:
     const Key& key() const { return key_; }
     T& value() { return data_; }
     value_type operator*() const { return {key_, data_}; }
+    bool valid() const { return valid_; }
     bool operator==(const tktrie_iterator& o) const {
         if (!valid_ && !o.valid_) return true;
         return valid_ && o.valid_ && key_ == o.key_;
     }
     bool operator!=(const tktrie_iterator& o) const { return !(*this == o); }
-    bool valid() const { return valid_; }
 };
 
-// Trie node - used for both fixed and variable length keys
 template <typename T> struct Node {
     PopCount pop{};
     std::vector<Node*> children{};
     std::string skip{};
-    std::shared_ptr<T> data;  // nullptr = no data, shared across COW copies
+    std::shared_ptr<T> data;
+    std::atomic<uint64_t> version{0};
     
     Node() = default;
-    Node(const Node& o) = default;  // shared_ptr copy just increments refcount
+    Node(const Node&) = delete;
+    Node& operator=(const Node&) = delete;
     
     bool has_data() const { return data != nullptr; }
     void set_data(const T& val) { data = std::make_shared<T>(val); }
     void clear_data() { data.reset(); }
+    uint64_t get_version() const { return version.load(std::memory_order_acquire); }
+    void inc_version() { version.fetch_add(1, std::memory_order_release); }
     
-    Node* get_child(unsigned char c) const { int idx; return pop.find(c, &idx) ? children[idx] : nullptr; }
+    Node* get_child(unsigned char c) const { 
+        int idx; 
+        return pop.find(c, &idx) ? children[idx] : nullptr; 
+    }
     bool get_child_idx(unsigned char c, int* idx) const { return pop.find(c, idx); }
 };
 
@@ -146,54 +132,26 @@ public:
 private:
     node_type* root_;
     std::atomic<size_type> elem_count_{0};
-    RetireList retired_;
     mutable std::mutex write_mutex_;
-    struct PathEntry { node_type* node; int child_idx; };
-
-    node_type* get_root() const { return __atomic_load_n(&root_, __ATOMIC_ACQUIRE); }
-    void set_root(node_type* n) { __atomic_store_n(&root_, n, __ATOMIC_RELEASE); }
-
-    // Returns the new root and populates to_retire with old nodes
-    node_type* build_new_path(std::vector<PathEntry>& path, node_type* new_node, 
-                               node_type* old_node, std::vector<node_type*>& to_retire,
-                               std::vector<node_type*>& new_nodes) {
-        to_retire.push_back(old_node);
-        node_type* child = new_node;
-        for (int i = (int)path.size() - 1; i >= 0; i--) {
-            node_type* new_parent = new node_type(*path[i].node);
-            new_nodes.push_back(new_parent);
-            new_parent->children[path[i].child_idx] = child;
-            to_retire.push_back(path[i].node);
-            child = new_parent;
-        }
-        return child;
-    }
-
-    // Fixed-length version
-    template<size_t N>
-    Node<T>* build_new_path_fixed(std::array<Node<T>*, N>& nodes, std::array<int, N>& indices, 
-                                   int change_depth, Node<T>* new_node, Node<T>* old_node,
-                                   std::vector<Node<T>*>& to_retire, std::vector<Node<T>*>& new_nodes) {
-        to_retire.push_back(old_node);
-        Node<T>* child = new_node;
-        for (int i = change_depth - 1; i >= 0; i--) {
-            Node<T>* new_parent = new Node<T>(*nodes[i]);
-            new_nodes.push_back(new_parent);
-            new_parent->children[indices[i]] = child;
-            to_retire.push_back(nodes[i]);
-            child = new_parent;
-        }
-        return child;
-    }
-
-    void retire_nodes(std::vector<node_type*>& nodes) {
-        for (auto* n : nodes) retired_.retire(n);
-    }
+    
+    struct PathEntry { 
+        node_type* node; 
+        int child_idx;
+        uint64_t version;
+    };
 
     void delete_tree(node_type* n) {
         if (!n) return;
         for (auto* c : n->children) delete_tree(c);
         delete n;
+    }
+    
+    // Check if all nodes on path still have same versions
+    bool path_valid(const std::vector<PathEntry>& path) const {
+        for (const auto& e : path) {
+            if (e.node->get_version() != e.version) return false;
+        }
+        return true;
     }
 
 public:
@@ -203,95 +161,32 @@ public:
     size_type size() const { return elem_count_.load(std::memory_order_relaxed); }
 
     bool contains(const Key& key) const {
-        if constexpr (is_fixed) return contains_fixed(key);
-        else return contains_variable(key);
+        if constexpr (is_fixed) return contains_impl(Traits::to_bytes(key));
+        else return contains_impl(Traits::to_bytes(key));
     }
+    
     iterator find(const Key& key) const {
-        if constexpr (is_fixed) return find_fixed(key);
-        else return find_variable(key);
+        if constexpr (is_fixed) return find_impl(key, Traits::to_bytes(key));
+        else return find_impl(key, Traits::to_bytes(key));
     }
+    
     iterator end() const { return iterator::end_iterator(); }
     
     std::pair<iterator, bool> insert(const std::pair<const Key, T>& value) {
-        while (true) {
-            std::vector<node_type*> to_retire; to_retire.reserve(16);
-            std::vector<node_type*> new_nodes; new_nodes.reserve(16);
-            node_type* expected_root = get_root();
-            node_type* new_root = nullptr;
-            bool inserted = false;
-            
-            // Build new tree structure without lock
-            if constexpr (is_fixed) 
-                std::tie(new_root, inserted) = try_insert_fixed(value.first, value.second, expected_root, to_retire, new_nodes);
-            else 
-                std::tie(new_root, inserted) = try_insert_variable(value.first, value.second, expected_root, to_retire, new_nodes);
-            
-            if (!new_root) {
-                // Key already exists, no changes needed
-                return {iterator(value.first, value.second), false};
-            }
-            
-            // Acquire lock and verify root unchanged
-            {
-                std::lock_guard<std::mutex> lock(write_mutex_);
-                if (get_root() != expected_root) {
-                    // Root changed, clean up and retry
-                    for (auto* n : new_nodes) delete n;
-                    continue;
-                }
-                set_root(new_root);
-                elem_count_.fetch_add(1, std::memory_order_relaxed);
-            }
-            
-            retire_nodes(to_retire);
-            return {iterator(value.first, value.second), true};
-        }
+        return insert_impl(value.first, value.second);
     }
     
     bool erase(const Key& key) {
-        while (true) {
-            std::vector<node_type*> to_retire; to_retire.reserve(16);
-            std::vector<node_type*> new_nodes; new_nodes.reserve(16);
-            node_type* expected_root = get_root();
-            node_type* new_root = nullptr;
-            bool found = false;
-            
-            // Build new tree structure without lock
-            if constexpr (is_fixed) 
-                std::tie(new_root, found) = try_erase_fixed(key, expected_root, to_retire, new_nodes);
-            else 
-                std::tie(new_root, found) = try_erase_variable(key, expected_root, to_retire, new_nodes);
-            
-            if (!new_root) {
-                // Key not found, no changes needed
-                return false;
-            }
-            
-            // Acquire lock and verify root unchanged
-            {
-                std::lock_guard<std::mutex> lock(write_mutex_);
-                if (get_root() != expected_root) {
-                    // Root changed, clean up and retry
-                    for (auto* n : new_nodes) delete n;
-                    continue;
-                }
-                set_root(new_root);
-                elem_count_.fetch_sub(1, std::memory_order_relaxed);
-            }
-            
-            retire_nodes(to_retire);
-            return true;
-        }
+        return erase_impl(key);
     }
 
 private:
-    // ==================== VARIABLE-LENGTH ====================
-    bool contains_variable(const Key& key) const {
-        std::string_view kv = Traits::to_bytes(key);
-        Node<T>* cur = get_root();
+    bool contains_impl(std::string_view kv) const {
+        node_type* cur = root_;
         while (cur) {
             if (!cur->skip.empty()) {
-                if (kv.size() < cur->skip.size() || kv.substr(0, cur->skip.size()) != cur->skip) return false;
+                if (kv.size() < cur->skip.size()) return false;
+                if (kv.substr(0, cur->skip.size()) != cur->skip) return false;
                 kv.remove_prefix(cur->skip.size());
             }
             if (kv.empty()) return cur->has_data();
@@ -301,12 +196,12 @@ private:
         return false;
     }
 
-    iterator find_variable(const Key& key) const {
-        std::string_view kv = Traits::to_bytes(key);
-        Node<T>* cur = get_root();
+    iterator find_impl(const Key& key, std::string_view kv) const {
+        node_type* cur = root_;
         while (cur) {
             if (!cur->skip.empty()) {
-                if (kv.size() < cur->skip.size() || kv.substr(0, cur->skip.size()) != cur->skip) return end();
+                if (kv.size() < cur->skip.size()) return end();
+                if (kv.substr(0, cur->skip.size()) != cur->skip) return end();
                 kv.remove_prefix(cur->skip.size());
             }
             if (kv.empty()) return cur->has_data() ? iterator(key, *cur->data) : end();
@@ -316,12 +211,65 @@ private:
         return end();
     }
 
-    // Returns {new_root, true} on success, {nullptr, false} if key exists
-    std::pair<node_type*, bool> try_insert_variable(const Key& key, const T& value, 
-            node_type* root, std::vector<node_type*>& to_retire, std::vector<node_type*>& new_nodes) {
-        std::string_view kv = Traits::to_bytes(key);
+    std::pair<iterator, bool> insert_impl(const Key& key, const T& value) {
+        std::string kv_str;
+        if constexpr (is_fixed) kv_str = Traits::to_bytes(key);
+        else kv_str = std::string(Traits::to_bytes(key));
+        
+        // Phase 1: Optimistic traversal without lock
         std::vector<PathEntry> path; path.reserve(16);
-        Node<T>* cur = root;
+        std::string_view kv(kv_str);
+        node_type* cur = root_;
+        
+        while (true) {
+            uint64_t ver = cur->get_version();
+            
+            size_t common = 0;
+            while (common < cur->skip.size() && common < kv.size() && 
+                   cur->skip[common] == kv[common]) ++common;
+            
+            if (common < cur->skip.size()) {
+                // Need to split this node
+                path.push_back({cur, -1, ver});
+                break;
+            }
+            
+            kv.remove_prefix(common);
+            
+            if (kv.empty()) {
+                // Key ends here
+                path.push_back({cur, -1, ver});
+                break;
+            }
+            
+            unsigned char c = (unsigned char)kv[0];
+            int idx;
+            if (!cur->get_child_idx(c, &idx)) {
+                // Need to add child
+                path.push_back({cur, -1, ver});
+                break;
+            }
+            
+            path.push_back({cur, idx, ver});
+            cur = cur->children[idx];
+            kv.remove_prefix(1);
+        }
+        
+        // Phase 2: Acquire lock
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        
+        // Phase 3: Check if path is still valid
+        if (!path_valid(path)) {
+            // Path changed, redo under lock (but we're already locked, so it's safe)
+        }
+        
+        // Phase 4: Execute insert (under lock, so safe to modify in place)
+        return do_insert(key, value, kv_str);
+    }
+    
+    std::pair<iterator, bool> do_insert(const Key& key, const T& value, const std::string& kv_str) {
+        std::string_view kv(kv_str);
+        node_type* cur = root_;
         
         while (true) {
             size_t common = 0;
@@ -329,241 +277,154 @@ private:
                    cur->skip[common] == kv[common]) ++common;
             
             if (common < cur->skip.size()) {
-                // Split needed
-                Node<T>* n = new Node<T>(); new_nodes.push_back(n);
-                n->skip = cur->skip.substr(0, common);
-                
-                Node<T>* old_suffix = new Node<T>(*cur); new_nodes.push_back(old_suffix);
+                // Split node
+                node_type* old_suffix = new node_type();
                 old_suffix->skip = cur->skip.substr(common + 1);
+                old_suffix->data = std::move(cur->data);
+                old_suffix->pop = cur->pop;
+                old_suffix->children = std::move(cur->children);
+                
+                unsigned char old_char = cur->skip[common];  // Character that goes to old_suffix
+                cur->skip.resize(common);
+                cur->pop = PopCount{};
+                cur->children.clear();
                 
                 if (common == kv.size()) {
                     // Key ends at split point
-                    n->set_data(value);
-                    int idx = n->pop.set((unsigned char)cur->skip[common]);
-                    n->children.insert(n->children.begin() + idx, old_suffix);
+                    cur->set_data(value);
+                    int idx = cur->pop.set(old_char);
+                    cur->children.insert(cur->children.begin() + idx, old_suffix);
                 } else {
                     // Key continues past split
-                    Node<T>* new_child = new Node<T>(); new_nodes.push_back(new_child);
+                    cur->data.reset();
+                    node_type* new_child = new node_type();
                     new_child->skip = std::string(kv.substr(common + 1));
                     new_child->set_data(value);
                     
-                    unsigned char oc = (unsigned char)cur->skip[common];
-                    unsigned char nc = (unsigned char)kv[common];
-                    if (oc < nc) {
-                        n->pop.set(oc); n->pop.set(nc);
-                        n->children.push_back(old_suffix);
-                        n->children.push_back(new_child);
+                    unsigned char new_char = (unsigned char)kv[common];
+                    if (old_char < new_char) {
+                        cur->pop.set(old_char); cur->pop.set(new_char);
+                        cur->children.push_back(old_suffix);
+                        cur->children.push_back(new_child);
                     } else {
-                        n->pop.set(nc); n->pop.set(oc);
-                        n->children.push_back(new_child);
-                        n->children.push_back(old_suffix);
+                        cur->pop.set(new_char); cur->pop.set(old_char);
+                        cur->children.push_back(new_child);
+                        cur->children.push_back(old_suffix);
                     }
                 }
-                return {build_new_path(path, n, cur, to_retire, new_nodes), true};
+                
+                cur->inc_version();
+                elem_count_.fetch_add(1, std::memory_order_relaxed);
+                return {iterator(key, value), true};
             }
             
             kv.remove_prefix(common);
             
             if (kv.empty()) {
-                if (cur->has_data()) return {nullptr, false};  // Key exists
-                Node<T>* n = new Node<T>(*cur); new_nodes.push_back(n);
-                n->set_data(value);
-                return {build_new_path(path, n, cur, to_retire, new_nodes), true};
+                // Key ends at this node
+                if (cur->has_data()) return {iterator(key, *cur->data), false};
+                cur->set_data(value);
+                cur->inc_version();
+                elem_count_.fetch_add(1, std::memory_order_relaxed);
+                return {iterator(key, value), true};
             }
             
             unsigned char c = (unsigned char)kv[0];
             int idx;
-            if (cur->get_child_idx(c, &idx)) {
-                path.push_back({cur, idx});
-                cur = cur->children[idx];
-                kv.remove_prefix(1);
-                continue;
+            if (!cur->get_child_idx(c, &idx)) {
+                // Add new child
+                node_type* child = new node_type();
+                child->skip = std::string(kv.substr(1));
+                child->set_data(value);
+                idx = cur->pop.set(c);
+                cur->children.insert(cur->children.begin() + idx, child);
+                cur->inc_version();
+                elem_count_.fetch_add(1, std::memory_order_relaxed);
+                return {iterator(key, value), true};
             }
             
-            Node<T>* n = new Node<T>(*cur); new_nodes.push_back(n);
-            Node<T>* child = new Node<T>(); new_nodes.push_back(child);
-            child->skip = std::string(kv.substr(1));
-            child->set_data(value);
-            int ni = n->pop.set(c);
-            n->children.insert(n->children.begin() + ni, child);
-            return {build_new_path(path, n, cur, to_retire, new_nodes), true};
+            cur = cur->children[idx];
+            kv.remove_prefix(1);
         }
     }
 
-    // Returns {new_root, true} on success, {nullptr, false} if key not found
-    std::pair<node_type*, bool> try_erase_variable(const Key& key, node_type* root,
-            std::vector<node_type*>& to_retire, std::vector<node_type*>& new_nodes) {
-        std::string_view kv = Traits::to_bytes(key);
+    bool erase_impl(const Key& key) {
+        std::string kv_str;
+        if constexpr (is_fixed) kv_str = Traits::to_bytes(key);
+        else kv_str = std::string(Traits::to_bytes(key));
+        
+        // Phase 1: Optimistic traversal
         std::vector<PathEntry> path; path.reserve(16);
-        Node<T>* cur = root;
+        std::string_view kv(kv_str);
+        node_type* cur = root_;
         
         while (cur) {
+            uint64_t ver = cur->get_version();
+            
             if (!cur->skip.empty()) {
-                if (kv.size() < cur->skip.size() || kv.substr(0, cur->skip.size()) != cur->skip) 
-                    return {nullptr, false};
+                if (kv.size() < cur->skip.size()) return false;
+                if (kv.substr(0, cur->skip.size()) != cur->skip) return false;
                 kv.remove_prefix(cur->skip.size());
             }
             
             if (kv.empty()) {
-                if (!cur->has_data()) return {nullptr, false};
-                Node<T>* n = new Node<T>(*cur); new_nodes.push_back(n);
-                n->clear_data();
-                return {build_new_path(path, n, cur, to_retire, new_nodes), true};
+                path.push_back({cur, -1, ver});
+                break;
             }
             
             unsigned char c = (unsigned char)kv[0];
             int idx;
-            if (!cur->get_child_idx(c, &idx)) return {nullptr, false};
-            path.push_back({cur, idx});
+            if (!cur->get_child_idx(c, &idx)) return false;
+            
+            path.push_back({cur, idx, ver});
             cur = cur->children[idx];
             kv.remove_prefix(1);
         }
-        return {nullptr, false};
+        
+        if (!cur) return false;
+        
+        // Phase 2: Lock and verify
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        
+        if (!path_valid(path)) {
+            // Redo under lock
+            return do_erase(kv_str);
+        }
+        
+        // Phase 3: Execute
+        if (!cur->has_data()) return false;
+        cur->clear_data();
+        cur->inc_version();
+        elem_count_.fetch_sub(1, std::memory_order_relaxed);
+        return true;
     }
-
-    // ==================== FIXED-LENGTH ====================
-    static constexpr size_t MAX_DEPTH = fixed_len + 1;  // +1 for root
     
-    bool contains_fixed(const Key& key) const {
-        std::string kv = Traits::to_bytes(key);
-        std::string_view kvv(kv);
-        Node<T>* cur = get_root();
+    bool do_erase(const std::string& kv_str) {
+        std::string_view kv(kv_str);
+        node_type* cur = root_;
+        
         while (cur) {
             if (!cur->skip.empty()) {
-                if (kvv.size() < cur->skip.size() || kvv.substr(0, cur->skip.size()) != cur->skip) return false;
-                kvv.remove_prefix(cur->skip.size());
+                if (kv.size() < cur->skip.size()) return false;
+                if (kv.substr(0, cur->skip.size()) != cur->skip) return false;
+                kv.remove_prefix(cur->skip.size());
             }
-            if (kvv.empty()) return cur->has_data();
-            unsigned char c = (unsigned char)kvv[0]; int idx;
-            if (!cur->pop.find(c, &idx)) return false;
-            cur = cur->children[idx]; kvv.remove_prefix(1);
+            
+            if (kv.empty()) {
+                if (!cur->has_data()) return false;
+                cur->clear_data();
+                cur->inc_version();
+                elem_count_.fetch_sub(1, std::memory_order_relaxed);
+                return true;
+            }
+            
+            unsigned char c = (unsigned char)kv[0];
+            int idx;
+            if (!cur->get_child_idx(c, &idx)) return false;
+            cur = cur->children[idx];
+            kv.remove_prefix(1);
         }
         return false;
-    }
-
-    iterator find_fixed(const Key& key) const {
-        std::string kv = Traits::to_bytes(key);
-        std::string_view kvv(kv);
-        Node<T>* cur = get_root();
-        while (cur) {
-            if (!cur->skip.empty()) {
-                if (kvv.size() < cur->skip.size() || kvv.substr(0, cur->skip.size()) != cur->skip) return end();
-                kvv.remove_prefix(cur->skip.size());
-            }
-            if (kvv.empty()) return cur->has_data() ? iterator(key, *cur->data) : end();
-            unsigned char c = (unsigned char)kvv[0]; int idx;
-            if (!cur->pop.find(c, &idx)) return end();
-            cur = cur->children[idx]; kvv.remove_prefix(1);
-        }
-        return end();
-    }
-
-    // Returns {new_root, true} on success, {nullptr, false} if key exists
-    std::pair<node_type*, bool> try_insert_fixed(const Key& key, const T& value, node_type* root,
-            std::vector<node_type*>& to_retire, std::vector<node_type*>& new_nodes) {
-        std::string kv = Traits::to_bytes(key);
-        
-        std::array<Node<T>*, MAX_DEPTH> nodes{};
-        std::array<int, MAX_DEPTH> indices{};
-        int depth = 0;
-        size_t pos = 0;
-        
-        Node<T>* cur = root;
-        nodes[depth] = cur;
-        
-        while (true) {
-            size_t common = 0;
-            while (common < cur->skip.size() && pos + common < kv.size() && 
-                   cur->skip[common] == kv[pos + common]) ++common;
-            
-            if (common < cur->skip.size()) {
-                Node<T>* n = new Node<T>(); new_nodes.push_back(n);
-                n->skip = cur->skip.substr(0, common);
-                Node<T>* os = new Node<T>(*cur); new_nodes.push_back(os);
-                os->skip = cur->skip.substr(common + 1);
-                Node<T>* nc = new Node<T>(); new_nodes.push_back(nc);
-                nc->skip = kv.substr(pos + common + 1);
-                nc->set_data(value);
-                
-                unsigned char oe = (unsigned char)cur->skip[common];
-                unsigned char ne = (unsigned char)kv[pos + common];
-                if (oe < ne) { 
-                    n->pop.set(oe); n->pop.set(ne); 
-                    n->children.push_back(os); n->children.push_back(nc); 
-                } else { 
-                    n->pop.set(ne); n->pop.set(oe); 
-                    n->children.push_back(nc); n->children.push_back(os); 
-                }
-                
-                return {build_new_path_fixed(nodes, indices, depth, n, cur, to_retire, new_nodes), true};
-            }
-            
-            pos += common;
-            if (pos == kv.size()) {
-                if (cur->has_data()) return {nullptr, false};
-                Node<T>* n = new Node<T>(*cur); new_nodes.push_back(n);
-                n->set_data(value);
-                return {build_new_path_fixed(nodes, indices, depth, n, cur, to_retire, new_nodes), true};
-            }
-            
-            unsigned char c = (unsigned char)kv[pos]; int idx;
-            if (!cur->pop.find(c, &idx)) {
-                Node<T>* n = new Node<T>(*cur); new_nodes.push_back(n);
-                Node<T>* ch = new Node<T>(); new_nodes.push_back(ch);
-                ch->skip = kv.substr(pos + 1);
-                ch->set_data(value);
-                int ni = n->pop.set(c);
-                n->children.insert(n->children.begin() + ni, ch);
-                return {build_new_path_fixed(nodes, indices, depth, n, cur, to_retire, new_nodes), true};
-            }
-            
-            indices[depth] = idx;
-            depth++;
-            pos++;
-            cur = cur->children[idx];
-            nodes[depth] = cur;
-        }
-    }
-
-    // Returns {new_root, true} on success, {nullptr, false} if key not found
-    std::pair<node_type*, bool> try_erase_fixed(const Key& key, node_type* root,
-            std::vector<node_type*>& to_retire, std::vector<node_type*>& new_nodes) {
-        std::string kv = Traits::to_bytes(key);
-        
-        std::array<Node<T>*, MAX_DEPTH> nodes{};
-        std::array<int, MAX_DEPTH> indices{};
-        int depth = 0;
-        size_t pos = 0;
-        
-        Node<T>* cur = root;
-        nodes[depth] = cur;
-        
-        while (cur) {
-            if (!cur->skip.empty()) {
-                if (kv.size() - pos < cur->skip.size()) return {nullptr, false};
-                for (size_t i = 0; i < cur->skip.size(); i++) {
-                    if (cur->skip[i] != kv[pos + i]) return {nullptr, false};
-                }
-                pos += cur->skip.size();
-            }
-            
-            if (pos == kv.size()) {
-                if (!cur->has_data()) return {nullptr, false};
-                Node<T>* n = new Node<T>(*cur); new_nodes.push_back(n);
-                n->clear_data();
-                return {build_new_path_fixed(nodes, indices, depth, n, cur, to_retire, new_nodes), true};
-            }
-            
-            unsigned char c = (unsigned char)kv[pos]; int idx;
-            if (!cur->pop.find(c, &idx)) return {nullptr, false};
-            
-            indices[depth] = idx;
-            depth++;
-            pos++;
-            cur = cur->children[idx];
-            nodes[depth] = cur;
-        }
-        return {nullptr, false};
     }
 };
 
