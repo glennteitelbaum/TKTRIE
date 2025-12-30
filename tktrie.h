@@ -1,6 +1,7 @@
 #pragma once
 // Thread-safe trie: lock-free reads via COW, global write lock
-// Any structural change copies the affected node
+// - Reads: completely lock-free
+// - Writes: global mutex, COW for structural changes
 
 #include <atomic>
 #include <cstdint>
@@ -47,6 +48,18 @@ public:
         }
         return 0;
     }
+    char next_char(char c) const {
+        uint8_t v = static_cast<uint8_t>(c);
+        int word = v >> 6;
+        int bit = v & 63;
+        uint64_t mask = ~((1ULL << (bit + 1)) - 1);
+        uint64_t remaining = bits[word] & mask;
+        if (remaining != 0) return static_cast<char>((word << 6) | std::countr_zero(remaining));
+        for (int w = word + 1; w < 4; ++w) {
+            if (bits[w] != 0) return static_cast<char>((w << 6) | std::countr_zero(bits[w]));
+        }
+        return '\0';
+    }
 };
 
 class RetireList {
@@ -79,12 +92,42 @@ struct Node {
         }
         return nullptr;
     }
+};
+
+template <typename Key, typename T> class tktrie;
+
+template <typename Key, typename T>
+class tktrie_iterator {
+public:
+    using value_type = std::pair<Key, T>;
     
-    void set_child(int idx, Node* child) {
-        __atomic_store_n(&children[idx], child, __ATOMIC_RELEASE);
+private:
+    const tktrie<Key, T>* trie_;
+    Key key_;
+    T data_;
+    bool valid_{false};
+
+public:
+    tktrie_iterator() : trie_(nullptr) {}
+    tktrie_iterator(const tktrie<Key, T>* t, const Key& k, const T& d) 
+        : trie_(t), key_(k), data_(d), valid_(true) {}
+    
+    static tktrie_iterator end_iterator() { return tktrie_iterator(); }
+    
+    const Key& key() const { return key_; }
+    T& value() { return data_; }
+    const T& value() const { return data_; }
+    
+    value_type operator*() const { return {key_, data_}; }
+    
+    bool operator==(const tktrie_iterator& o) const {
+        if (!valid_ && !o.valid_) return true;
+        if (!valid_ || !o.valid_) return false;
+        return key_ == o.key_;
     }
+    bool operator!=(const tktrie_iterator& o) const { return !(*this == o); }
     
-    int child_count() const { return pop.count(); }
+    bool valid() const { return valid_; }
 };
 
 template <typename Key, typename T>
@@ -92,12 +135,13 @@ class tktrie {
 public:
     using node_type = Node<T>;
     using size_type = std::size_t;
+    using iterator = tktrie_iterator<Key, T>;
 
 private:
     node_type* root_;
     std::atomic<size_type> elem_count_{0};
     RetireList retired_;
-    std::mutex write_mutex_;
+    mutable std::mutex write_mutex_;
 
     node_type* get_root() const { return __atomic_load_n(&root_, __ATOMIC_ACQUIRE); }
     void set_root(node_type* n) { __atomic_store_n(&root_, n, __ATOMIC_RELEASE); }
@@ -128,9 +172,33 @@ public:
         return false;
     }
 
-    bool insert(const std::pair<const Key, T>& value) {
+    iterator find(const Key& key) const {
+        std::string_view kv(key);
+        node_type* cur = get_root();
+        while (cur) {
+            const std::string& skip = cur->skip;
+            if (!skip.empty()) {
+                if (kv.size() < skip.size() || kv.substr(0, skip.size()) != skip)
+                    return end();
+                kv.remove_prefix(skip.size());
+            }
+            if (kv.empty()) {
+                if (cur->has_data) return iterator(this, key, cur->data);
+                return end();
+            }
+            char c = kv[0];
+            kv.remove_prefix(1);
+            cur = cur->get_child(c);
+        }
+        return end();
+    }
+
+    iterator end() const { return iterator::end_iterator(); }
+
+    std::pair<iterator, bool> insert(const std::pair<const Key, T>& value) {
         std::lock_guard<std::mutex> lock(write_mutex_);
-        return insert_impl(value.first, value.second);
+        bool inserted = insert_impl(value.first, value.second);
+        return {iterator(this, value.first, value.second), inserted};
     }
 
     bool erase(const Key& key) {
@@ -157,10 +225,9 @@ private:
             while (common < skip.size() && kpos + common < key.size() &&
                    skip[common] == key[kpos + common]) ++common;
 
-            // Exact match - just set has_data (no structural change if already has children)
+            // Exact match
             if (kpos + common == key.size() && common == skip.size()) {
                 if (cur->has_data) return false;
-                // Copy node to set data
                 node_type* n = new node_type(*cur);
                 n->has_data = true;
                 n->data = value;
@@ -194,7 +261,6 @@ private:
                 char c = key[kpos];
                 int idx;
                 if (!cur->pop.find(c, &idx)) {
-                    // Add new child - copy node
                     node_type* n = new node_type(*cur);
                     node_type* leaf = new node_type();
                     leaf->skip = key.substr(kpos + 1);
@@ -256,7 +322,6 @@ private:
             }
             if (kpos == key.size()) {
                 if (!cur->has_data) return false;
-                // Copy node to clear data
                 node_type* n = new node_type(*cur);
                 n->has_data = false;
                 n->data = T{};
