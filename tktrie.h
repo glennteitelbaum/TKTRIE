@@ -10,6 +10,7 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
+#include <array>
 
 namespace gteitelbaum {
 
@@ -135,7 +136,8 @@ template <typename Key, typename T>
 class tktrie {
 public:
     using Traits = tktrie_traits<Key>;
-    static constexpr bool is_fixed = (Traits::fixed_len > 0);
+    static constexpr size_t fixed_len = Traits::fixed_len;
+    static constexpr bool is_fixed = (fixed_len > 0);
     using node_type = std::conditional_t<is_fixed, NodeFL<T>, NodeVL<T>>;
     using size_type = std::size_t;
     using iterator = tktrie_iterator<Key, T>;
@@ -157,6 +159,21 @@ private:
             node_type* new_parent = new node_type(*path[i].node);
             new_parent->children[path[i].child_idx] = child;
             retired_.retire(path[i].node);
+            child = new_parent;
+        }
+        set_root(child);
+    }
+
+    // Fixed-length path commit using array
+    template<size_t N>
+    void commit_fixed_path(std::array<NodeFL<T>*, N>& nodes, std::array<int, N>& indices, 
+                           int depth, int change_depth, NodeFL<T>* new_node, NodeFL<T>* old_node) {
+        retired_.retire(old_node);
+        NodeFL<T>* child = new_node;
+        for (int i = change_depth - 1; i >= 0; i--) {
+            NodeFL<T>* new_parent = new NodeFL<T>(*nodes[i]);
+            new_parent->children[indices[i]] = child;
+            retired_.retire(nodes[i]);
             child = new_parent;
         }
         set_root(child);
@@ -185,7 +202,8 @@ public:
     iterator end() const { return iterator::end_iterator(); }
     std::pair<iterator, bool> insert(const std::pair<const Key, T>& value) {
         std::lock_guard<std::mutex> lock(write_mutex_);
-        bool ins; if constexpr (is_fixed) ins = insert_fixed(value.first, value.second);
+        bool ins; 
+        if constexpr (is_fixed) ins = insert_fixed(value.first, value.second);
         else ins = insert_variable(value.first, value.second);
         return {iterator(value.first, value.second), ins};
     }
@@ -344,6 +362,8 @@ private:
     }
 
     // ==================== FIXED-LENGTH ====================
+    static constexpr size_t MAX_DEPTH = fixed_len + 1;  // +1 for root
+    
     bool contains_fixed(const Key& key) const {
         std::string kv = Traits::to_bytes(key);
         std::string_view kvv(kv);
@@ -381,12 +401,28 @@ private:
     bool insert_fixed(const Key& key, const T& value) {
         std::string kv = Traits::to_bytes(key);
         std::string_view kvv(kv);
-        std::vector<PathEntry> path;
+        
+        // Phase 1: Collect path
+        std::array<NodeFL<T>*, MAX_DEPTH> nodes{};
+        std::array<int, MAX_DEPTH> indices{};
+        std::array<size_t, MAX_DEPTH> key_pos{};  // Position in key when entering each node
+        int depth = 0;
+        size_t pos = 0;
+        
         NodeFL<T>* cur = get_root();
+        nodes[depth] = cur;
+        key_pos[depth] = pos;
+        
         while (true) {
+            // Match skip
             size_t common = 0;
-            while (common < cur->skip.size() && common < kvv.size() && cur->skip[common] == kvv[common]) ++common;
+            while (common < cur->skip.size() && pos + common < kv.size() && 
+                   cur->skip[common] == kv[pos + common]) ++common;
+            
             if (common < cur->skip.size()) {
+                // Split needed at this node
+                kvv = std::string_view(kv).substr(pos);
+                
                 NodeFL<T>* n = new NodeFL<T>();
                 n->skip = cur->skip.substr(0, common);
                 NodeFL<T>* os = new NodeFL<T>(*cur);
@@ -394,60 +430,97 @@ private:
                 NodeFL<T>* nc = new NodeFL<T>();
                 nc->skip = std::string(kvv.substr(common + 1));
                 nc->has_data = true; nc->data = value;
-                unsigned char oe = (unsigned char)cur->skip[common], ne = (unsigned char)kvv[common];
-                if (oe < ne) { n->pop.set(oe); n->pop.set(ne); n->children.push_back(os); n->children.push_back(nc); }
-                else { n->pop.set(ne); n->pop.set(oe); n->children.push_back(nc); n->children.push_back(os); }
-                commit_path(path, n, cur);
+                
+                unsigned char oe = (unsigned char)cur->skip[common];
+                unsigned char ne = (unsigned char)kvv[common];
+                if (oe < ne) { 
+                    n->pop.set(oe); n->pop.set(ne); 
+                    n->children.push_back(os); n->children.push_back(nc); 
+                } else { 
+                    n->pop.set(ne); n->pop.set(oe); 
+                    n->children.push_back(nc); n->children.push_back(os); 
+                }
+                
+                commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
-            kvv.remove_prefix(common);
-            if (kvv.empty()) {
+            
+            pos += common;
+            if (pos == kv.size()) {
+                // Key exhausted - set data on this node
                 if (cur->has_data) return false;
                 NodeFL<T>* n = new NodeFL<T>(*cur);
                 n->has_data = true; n->data = value;
-                commit_path(path, n, cur);
+                commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
-            unsigned char c = (unsigned char)kvv[0]; int idx;
+            
+            // Follow child
+            unsigned char c = (unsigned char)kv[pos]; int idx;
             if (!cur->pop.find(c, &idx)) {
+                // Add new child
                 NodeFL<T>* n = new NodeFL<T>(*cur);
                 NodeFL<T>* ch = new NodeFL<T>();
-                ch->skip = std::string(kvv.substr(1));
+                ch->skip = kv.substr(pos + 1);
                 ch->has_data = true; ch->data = value;
-                int ni = n->pop.set(c); n->children.insert(n->children.begin() + ni, ch);
-                commit_path(path, n, cur);
+                int ni = n->pop.set(c);
+                n->children.insert(n->children.begin() + ni, ch);
+                commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
-            path.push_back({cur, idx});
-            cur = cur->children[idx]; kvv.remove_prefix(1);
+            
+            indices[depth] = idx;
+            depth++;
+            pos++;
+            cur = cur->children[idx];
+            nodes[depth] = cur;
+            key_pos[depth] = pos;
         }
     }
 
     bool erase_fixed(const Key& key) {
         std::string kv = Traits::to_bytes(key);
-        std::string_view kvv(kv);
-        std::vector<PathEntry> path;
+        
+        // Phase 1: Collect path
+        std::array<NodeFL<T>*, MAX_DEPTH> nodes{};
+        std::array<int, MAX_DEPTH> indices{};
+        int depth = 0;
+        size_t pos = 0;
+        
         NodeFL<T>* cur = get_root();
+        nodes[depth] = cur;
+        
         while (cur) {
+            // Match skip
             if (!cur->skip.empty()) {
-                if (kvv.size() < cur->skip.size() || kvv.substr(0, cur->skip.size()) != cur->skip) return false;
-                kvv.remove_prefix(cur->skip.size());
+                if (kv.size() - pos < cur->skip.size()) return false;
+                for (size_t i = 0; i < cur->skip.size(); i++) {
+                    if (cur->skip[i] != kv[pos + i]) return false;
+                }
+                pos += cur->skip.size();
             }
-            if (kvv.empty()) {
+            
+            if (pos == kv.size()) {
+                // Found - erase
                 if (!cur->has_data) return false;
                 NodeFL<T>* n = new NodeFL<T>(*cur);
                 n->has_data = false; n->data = T{};
-                commit_path(path, n, cur);
+                commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_sub(1, std::memory_order_relaxed);
                 return true;
             }
-            unsigned char c = (unsigned char)kvv[0]; int idx;
+            
+            unsigned char c = (unsigned char)kv[pos]; int idx;
             if (!cur->pop.find(c, &idx)) return false;
-            path.push_back({cur, idx});
-            cur = cur->children[idx]; kvv.remove_prefix(1);
+            
+            indices[depth] = idx;
+            depth++;
+            pos++;
+            cur = cur->children[idx];
+            nodes[depth] = cur;
         }
         return false;
     }
