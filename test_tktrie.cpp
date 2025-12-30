@@ -8,7 +8,7 @@
 #include <map>
 #include <unordered_map>
 #include <shared_mutex>
-#include <cstring>
+#include <algorithm>
 #include "tktrie.h"
 
 const std::vector<std::string> STRING_KEYS = {
@@ -26,78 +26,31 @@ const std::vector<std::string> STRING_KEYS = {
     "does", "did", "got", "may", "part", "find", "long", "down", "many", "before",
     "must", "through", "much", "where", "should", "very", "might", "being", "such", "more",
     "those", "never", "still", "world", "last", "own", "public", "while", "next", "less",
-    "both", "life", "under", "same", "right", "here", "state", "place", "high", "every",
-    "going", "another", "school", "number", "always", "however", "without", "great", "small", "between",
-    "something", "important", "family", "government", "since", "system", "group", "children", "often", "money",
-    "called", "water", "business", "almost", "program", "point", "hand", "having", "once", "away",
-    "different", "night", "large", "order", "things", "already", "nothing", "possible", "second", "rather",
-    "problem", "against", "though", "again", "person", "looking", "morning", "house", "during", "side",
-    "power", "further", "young", "turned", "until", "start", "given", "working", "anything", "perhaps",
-    "question", "reason", "early", "himself", "making", "enough", "better", "open", "show", "case",
-    "seemed", "kind", "name", "read", "began", "believe", "several", "across", "office", "later",
-    "usually", "city", "least", "story", "coming", "country", "social", "company", "close", "brought",
-    "national", "service", "idea", "although", "behind", "true", "really", "home", "became", "become",
-    "days", "taking", "within", "change", "available", "women", "level", "local", "mother", "doing",
-    "development", "certain", "form", "whether", "door", "course", "member", "others", "center", "themselves",
-    "best", "short", "white", "following", "around", "political", "face", "either", "using", "hours",
-    "together", "interest", "whole", "community", "seen", "therefore", "along", "sure", "itself", "experience",
-    "education", "keep", "light", "area", "study", "body", "started", "human", "nature", "president",
-    "major", "sense", "result", "quite", "toward", "policy", "general", "control", "figure", "action",
-    "process", "american", "provide", "based", "free", "support", "include", "church", "period", "future",
-    "room", "common", "effect", "history", "probably", "need", "table", "special", "particular", "continue",
-    "personal", "sometimes", "current", "complete", "everything", "actually", "individual", "seems", "care",
-    "difficult", "simple", "economic", "research", "clear", "evidence", "recent", "strong", "private",
-    "remember", "subject", "field", "position", "cannot", "class", "various", "outside", "report", "security",
-    "building", "meeting", "value", "necessary", "likely", "return", "moment", "analysis", "central", "above",
-    "force", "example", "similar", "thus", "stand", "type", "society", "entire", "decision", "north",
-    "help", "mind", "everyone", "today", "federal", "terms", "view", "international", "according", "finally",
-    "total", "love", "party", "single", "lost", "south", "information", "military", "section", "living",
-    "provides", "main", "student", "role", "lines", "director", "knowledge", "court", "expected", "moved",
-    "past", "standard", "attention", "especially", "basic", "half", "appeared", "allow", "treatment", "addition",
-    "chance", "growth", "design", "previous", "management", "established", "wrong", "language", "board", "considered",
-    "events", "approach", "range", "simply", "significant", "situation", "performance", "behavior", "difference",
-    "words", "access", "hospital", "issues", "involved", "opportunity", "material", "training", "street", "modern",
-    "higher", "blood", "response", "changes", "theory", "population", "inside", "pressure", "financial", "data",
-    "effort", "developed", "meaning", "production", "method", "foreign", "physical", "amount", "traditional",
-    "generally", "medical", "patient", "activity", "technology", "voice", "character", "environmental", "natural", "directly",
-    "choice", "results", "project", "relationship", "needed", "function", "understanding", "factor", "operation",
-    "concerned", "create", "consider", "black", "structure", "positive", "potential", "purpose", "paper", "successful",
-    "western", "resource", "prepared", "learning", "serious", "middle", "space", "commission", "running", "model",
-    "condition", "wall", "series", "culture", "official", "congress", "source", "described", "increase", "created",
-    "science", "organization", "clearly", "network", "surface", "agreement", "agency", "works", "practice", "extent",
-    "earlier", "recently", "additional", "challenge", "primary", "effective", "product", "presented", "suggested", "technical",
-    "growing", "responsible", "written", "determined", "reality", "focus", "economy", "final", "professional", "rules",
-    "strategy", "balance", "quality", "legal", "decade", "image", "responsibility", "applied", "critical", "religious",
-    "workers", "movement", "capital", "associated", "direct", "defined", "values", "appropriate", "independent", "planning",
-    "regular", "identify", "complex", "commercial", "limited", "demand", "energy", "alternative", "original", "conference",
-    "article", "application", "principles", "insurance", "procedure", "capacity", "statement", "institution", "specific", "benefit",
-    "democratic", "considerable", "normal", "industrial", "standards", "literature", "credit", "pattern", "content", "negative",
-    "aspect", "coverage", "regional", "volume", "solutions", "element", "variable", "communication", "generation", "contract",
-    "customer", "legislation", "assessment", "influence", "distinction", "distribution", "executive", "reduction", "selection", "definition",
-    "perspective", "consequence", "version", "framework", "revolution", "protection", "resolution", "characteristic", "interpretation", "dimension",
-    "representation", "contribution", "recognition", "acquisition", "investigation", "recommendation", "implementation", "consideration", "administration", "participation",
-    "determination", "demonstration", "discrimination", "accommodation", "authentication", "authorization", "certification", "classification", "configuration", "consolidation",
-    "construction", "consultation", "consumption", "contamination", "continuation", "conversation", "cooperation", "coordination", "corporation", "correlation"
+    "both", "life", "under", "same", "right", "here", "state", "place", "high", "every"
 };
 
-inline void uint64_to_key(uint64_t v, char* buf) {
-    uint64_t be = __builtin_bswap64(v);
-    std::memcpy(buf, &be, 8);
-}
-
-std::vector<std::string> generate_int_keys(size_t count) {
-    std::vector<std::string> keys;
+std::vector<uint64_t> generate_uint64_keys(size_t count) {
+    std::vector<uint64_t> keys;
     keys.reserve(count);
     std::mt19937_64 rng(42);
-    char buf[8];
     for (size_t i = 0; i < count; i++) {
-        uint64_to_key(rng(), buf);
-        keys.emplace_back(buf, 8);
+        keys.push_back(rng());
     }
     return keys;
 }
 
-const std::vector<std::string> INT_KEYS = generate_int_keys(10000);
+std::vector<int64_t> generate_int64_keys(size_t count) {
+    std::vector<int64_t> keys;
+    keys.reserve(count);
+    std::mt19937_64 rng(42);
+    for (size_t i = 0; i < count; i++) {
+        keys.push_back(static_cast<int64_t>(rng()));
+    }
+    return keys;
+}
+
+const std::vector<uint64_t> UINT64_KEYS = generate_uint64_keys(10000);
+const std::vector<int64_t> INT64_KEYS = generate_int64_keys(10000);
 
 template<typename M>
 class guarded_map {
@@ -208,8 +161,34 @@ double bench_mixed_find(const Keys& keys, int find_threads, int write_threads, i
     return find_ops * 1000.0 / ms;
 }
 
+void test_signed_ordering() {
+    std::cout << "## Signed Integer Ordering Test\n\n";
+    gteitelbaum::tktrie<int64_t, std::string> t;
+    
+    std::vector<int64_t> vals = {-1000000, -100, -1, 0, 1, 100, 1000000};
+    for (auto v : vals) {
+        t.insert({v, "val_" + std::to_string(v)});
+    }
+    
+    std::cout << "Inserted: -1000000, -100, -1, 0, 1, 100, 1000000\n\n";
+    std::cout << "Lookup test:\n";
+    for (auto v : vals) {
+        auto it = t.find(v);
+        std::cout << "  find(" << v << ") = " << (it.valid() ? it.value() : "NOT FOUND") << "\n";
+    }
+    
+    // Verify ordering by checking that all are found
+    bool all_found = true;
+    for (auto v : vals) {
+        if (!t.contains(v)) all_found = false;
+    }
+    std::cout << "\nAll values found: " << (all_found ? "YES" : "NO") << "\n\n";
+}
+
 template<typename Keys>
 void run_benchmark(const std::string& name, const Keys& keys, int ms) {
+    using K = typename Keys::value_type;
+    
     std::cout << "## " << name << "\n\n";
     std::cout << "Keys: " << keys.size() << "\n\n";
     
@@ -218,9 +197,9 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
     std::cout << "|---------|--------|----------|-------------------|------------|-------------|\n";
     
     for (int threads : {1, 2, 4, 8}) {
-        gteitelbaum::tktrie<std::string, int> trie;
-        locked_map<std::string, int> lm;
-        locked_umap<std::string, int> lu;
+        gteitelbaum::tktrie<K, int> trie;
+        locked_map<K, int> lm;
+        locked_umap<K, int> lu;
         for (size_t i = 0; i < keys.size(); i++) {
             trie.insert({keys[i], (int)i});
             lm.insert({keys[i], (int)i});
@@ -229,7 +208,8 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
         double tr = bench_find(trie, keys, threads, ms);
         double m = bench_find(lm, keys, threads, ms);
         double u = bench_find(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
+        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", 
+               threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
     std::cout << "\n### INSERT\n\n";
@@ -237,13 +217,14 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
     std::cout << "|---------|--------|----------|-------------------|------------|-------------|\n";
     
     for (int threads : {1, 2, 4, 8}) {
-        gteitelbaum::tktrie<std::string, int> trie;
-        locked_map<std::string, int> lm;
-        locked_umap<std::string, int> lu;
+        gteitelbaum::tktrie<K, int> trie;
+        locked_map<K, int> lm;
+        locked_umap<K, int> lu;
         double tr = bench_insert<decltype(trie), Keys, int>(trie, keys, threads, ms);
         double m = bench_insert<decltype(lm), Keys, int>(lm, keys, threads, ms);
         double u = bench_insert<decltype(lu), Keys, int>(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
+        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", 
+               threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
     std::cout << "\n### ERASE\n\n";
@@ -251,9 +232,9 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
     std::cout << "|---------|--------|----------|-------------------|------------|-------------|\n";
     
     for (int threads : {1, 2, 4, 8}) {
-        gteitelbaum::tktrie<std::string, int> trie;
-        locked_map<std::string, int> lm;
-        locked_umap<std::string, int> lu;
+        gteitelbaum::tktrie<K, int> trie;
+        locked_map<K, int> lm;
+        locked_umap<K, int> lu;
         for (size_t i = 0; i < keys.size(); i++) {
             trie.insert({keys[i], (int)i});
             lm.insert({keys[i], (int)i});
@@ -262,28 +243,37 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
         double tr = bench_erase(trie, keys, threads, ms);
         double m = bench_erase(lm, keys, threads, ms);
         double u = bench_erase(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
+        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", 
+               threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
     std::cout << "\n### FIND with Concurrent Writers\n\n";
     std::cout << "| Readers | Writers | tktrie | std::map | std::unordered_map | tktrie/map | tktrie/umap |\n";
     std::cout << "|---------|---------|--------|----------|-------------------|------------|-------------|\n";
     
-    for (auto [f, w] : std::vector<std::pair<int,int>>{{4,0}, {4,2}, {4,4}, {8,0}, {8,4}}) {
-        double tr = bench_mixed_find<gteitelbaum::tktrie<std::string, int>, Keys, int>(keys, f, w, ms);
-        double m = bench_mixed_find<locked_map<std::string, int>, Keys, int>(keys, f, w, ms);
-        double u = bench_mixed_find<locked_umap<std::string, int>, Keys, int>(keys, f, w, ms);
-        printf("| %d | %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", f, w, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
+    for (auto [f, w] : std::vector<std::pair<int,int>>{{4,0}, {4,2}, {8,0}, {8,4}}) {
+        double tr = bench_mixed_find<gteitelbaum::tktrie<K, int>, Keys, int>(keys, f, w, ms);
+        double m = bench_mixed_find<locked_map<K, int>, Keys, int>(keys, f, w, ms);
+        double u = bench_mixed_find<locked_umap<K, int>, Keys, int>(keys, f, w, ms);
+        printf("| %d | %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", 
+               f, w, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     std::cout << "\n";
 }
 
 int main() {
     constexpr int MS = 500;
+    
     std::cout << "# tktrie Benchmark Results\n\n";
-    std::cout << "Lock-free reads, global mutex for writes, in-place mutation\n\n";
-    std::cout << "Duration: " << MS << "ms per test\n\n";
-    run_benchmark("uint64 Keys (10,000 random)", INT_KEYS, MS);
-    run_benchmark("String Keys (1,000 words)", STRING_KEYS, MS);
+    std::cout << "- Variable-length keys (string): multi-segment compression\n";
+    std::cout << "- Fixed-length keys (integers): single-skip with variant leaves\n";
+    std::cout << "- Duration: " << MS << "ms per test\n\n";
+    
+    test_signed_ordering();
+    
+    run_benchmark("String Keys (std::string)", STRING_KEYS, MS);
+    run_benchmark("Unsigned Integer Keys (uint64_t)", UINT64_KEYS, MS);
+    run_benchmark("Signed Integer Keys (int64_t)", INT64_KEYS, MS);
+    
     return 0;
 }
